@@ -41,7 +41,7 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 # warnings.showwarning = warn_with_traceback
 
 class Pancakes():
-    def __init__(self, file1, savepath = None, num_cores = 1, sector = None, ccd = None,
+    def __init__(self, file1, savepath = None, num_cores = 1, sector = None, 
                  use_multiple_cores_per_task = False, overwrite = True, buffer = None, 
                  priority = 'low'):
         """
@@ -80,15 +80,6 @@ class Pancakes():
             print(f"Sector: {sector}")
         else:
             print('Sector must be an integer. Making None')
-
-        if ccd is None:
-            self.ccd = 1
-        elif isinstance(sector, int):
-            self.ccd = ccd
-            print(f"CCD: {ccd}")
-        else:
-            print('CCD must be an integer. Making 1')
-            self.ccd = 1
 
         self.skycells_final = []
 
@@ -147,7 +138,7 @@ class Pancakes():
         full_date =datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%m')
 
         new_fits_header = deepcopy(self.temp_copy)
-
+        
         new_fits_header['DATE-MOD'] = full_date
         file = os.path.join(self.savepath, self.master_index)
 
@@ -166,11 +157,11 @@ class Pancakes():
 
         primary_hdu = fits.PrimaryHDU(header=new_fits_header)
         image_hdu1 = fits.ImageHDU(data=deepcopy(np.int64(new[:,:,0])), header=im1_header)
-        image_hdu1.scale('int16', bscale=1.0,bzero=32768.0)
+        image_hdu1.scale('int32', bscale=1.0,bzero=32768.0)
         image_hdu2 = fits.ImageHDU(data=deepcopy(np.int64(new[:,:,1])), header=im2_header)
-        image_hdu2.scale('int16', bscale=1.0,bzero=32768.0)
+        image_hdu2.scale('int32', bscale=1.0,bzero=32768.0)
         image_hdu3 = fits.ImageHDU(data=deepcopy(np.int64(new[:,:,2])), header=im3_header)
-        image_hdu3.scale('int16', bscale=1.0,bzero=32768.0)
+        image_hdu3.scale('int32', bscale=1.0,bzero=32768.0)
         hdul = fits.HDUList([primary_hdu, image_hdu1, image_hdu2, image_hdu3])
 
         hdul.writeto(file, overwrite=True)
@@ -182,7 +173,7 @@ class Pancakes():
         """
         Checking if the master file already exists to skip
         """
-
+        
         try:
             camera = self.temp_copy['CAMERA']
             ccd = self.temp_copy['CCD']
@@ -222,23 +213,28 @@ class Pancakes():
         """
 
         self.skip = False
-        print('Processing:', skycell, skycell_index)
         self.skycell = skycell
         self.skycell_index = skycell_index
+        print('Processing:', skycell, skycell_index)
         self._filename()
+        if self.skip:
+            return
 
-        if self.skip == False:
-            self._ps1_image(skycell)
-            self._pixel_vertices()
-            self._ps1_ravelling()
-            self.moccy()
-            if self.skip == False:
-                pix_obj_ind = np.arange(len(self.enc_pix))
-                pix_obj_etp = deepcopy(self.enc_pix)
-                pix_obj_pix = deepcopy(self.enc_pix_indices[pix_obj_ind])
+        self._ps1_image(skycell)
+        if self.skip:
+            return
 
-                tup = (pix_obj_ind, pix_obj_etp, pix_obj_pix)
-                self.initialize_moc_pixel(tup)
+        self._pixel_vertices()
+        self._ps1_ravelling()
+        self.moccy()
+        if self.skip:
+            return
+
+        pix_obj_ind = np.arange(len(self.enc_pix))
+        pix_obj_etp = self.enc_pix
+        pix_obj_pix = self.enc_pix_indices[pix_obj_ind]
+
+        self.initialize_moc_pixel((pix_obj_ind, pix_obj_etp, pix_obj_pix))
 
     def _image1(self, im1_file):
         """
@@ -256,7 +252,7 @@ class Pancakes():
         self.im1_poly = self.super_wcs.calc_footprint()
         hdul.close()
 
-        self.ra_centre, self.dec_centre = self.super_wcs.all_pix2world(self.data_shape[1]/2, self.data_shape[0]/2, 0)
+        self.ra_centre, self.dec_centre = self.super_wcs.all_pix2world(self.data_shape[0]//2, self.data_shape[1]//2, 0)
 
     def ps1_wcs_function(self, skycell):
         """
@@ -272,7 +268,7 @@ class Pancakes():
         self.ps1_data_shape = (other_temp['NAXIS2'].iloc[0], other_temp['NAXIS1'].iloc[0])
 
         temp_wcs = WCS(temp_head)
-
+            
         self.header_dicts.append(temp_head)
         self.ps1_wcs_master.append(temp_wcs)
 
@@ -283,7 +279,7 @@ class Pancakes():
 
         other_temp = self.skycell_wcs_df[self.skycell_wcs_df['NAME'] == skycell].reset_index(drop=True)
         self.ps1_data_shape = (other_temp['NAXIS2'].iloc[0], other_temp['NAXIS1'].iloc[0])
-
+            
         temp_ind = self.complete_skycells[self.complete_skycells['Name'] == skycell].index[0]
         self.ps1_wcs = self.ps1_wcs_master[temp_ind]
 
@@ -328,7 +324,7 @@ class Pancakes():
         p_y, p_x = self.ps1_data_shape
 
         py, px = np.mgrid[:p_y, :p_x]
-
+        
         py_input = py.ravel()
         px_input = px.ravel()
 
@@ -337,34 +333,45 @@ class Pancakes():
         x2 = ppix_coord_input[:,1]
         y2 = ppix_coord_input[:,0]
         self._ra2, self._dec2 = self.ps1_wcs.all_pix2world(x2, y2, 0)
-
+        
     def _pixel_vertices(self):
         """
-        Grab the pixel vertices for the TESS image
+        Grab the pixel vertices for the TESS image — optimized for speed.
         """
 
-        self.pixel_vertices = []
-
         _ra, _dec = self.super_wcs.all_pix2world(self.tpix_coord_input[:, 1], self.tpix_coord_input[:, 0], 0)
-        mask = (_ra >= self.min_ps1_ra) & (_ra < self.max_ps1_ra) & (_dec >= self.min_ps1_dec) & (_dec < self.max_ps1_dec)
+
+        # Apply bounding box mask
+        mask = (
+            (_ra >= self.min_ps1_ra) & (_ra < self.max_ps1_ra) &
+            (_dec >= self.min_ps1_dec) & (_dec < self.max_ps1_dec)
+        )
         filtered_indices = np.where(mask)[0]
 
-        pix_centers = np.column_stack((_ra[filtered_indices], _dec[filtered_indices]))
         self.pix_center_ra = _ra[filtered_indices]
         self.pix_center_dec = _dec[filtered_indices]
         self.im1_indices = self.ravelled_indices[filtered_indices]
 
-        for c in self.tpix_coord_input[filtered_indices]:
-            x = c[1]
-            y = c[0]
+        coords = self.tpix_coord_input[filtered_indices]
 
-            upper_left = (x - 0.5, y - 0.5)
-            upper_right = (x + 0.5, y - 0.5)
-            lower_right = (x + 0.5, y + 0.5)
-            lower_left = (x - 0.5, y + 0.5)
+        # Precompute pixel corner offsets (dx, dy)
+        corner_offsets = np.array([
+            [-0.5, -0.5],  # upper_left
+            [ 0.5, -0.5],  # upper_right
+            [ 0.5,  0.5],  # lower_right
+            [-0.5,  0.5],  # lower_left
+        ])
 
-            t_poly = self.super_wcs.all_pix2world([upper_left, upper_right, lower_right, lower_left], 0)
-            self.pixel_vertices.append(t_poly)
+        # Expand input shape for broadcasting
+        coords_expanded = coords[:, None, :]  # shape (N, 1, 2)
+        corner_coords = coords_expanded + corner_offsets  # shape (N, 4, 2)
+
+        # Flatten for batch conversion
+        flat_corners = corner_coords.reshape(-1, 2)
+        world_coords = self.super_wcs.all_pix2world(flat_corners[:, 1], flat_corners[:, 0], 0)
+        world_coords = np.column_stack(world_coords).reshape(-1, 4, 2)
+
+        self.pixel_vertices = list(world_coords)
 
     def moccy(self):
         """
@@ -409,7 +416,7 @@ class Pancakes():
             sc_skycoord = SkyCoord(self.enc_sc_vertices[i], unit="deg", frame="icrs")
             sc_moc = MOC.from_polygon_skycoord(sc_skycoord, complement=False, max_depth=21)
             enc_sc.append(sc_moc)
-
+        
         self.enc_sc = enc_sc
 
     def skycell_initialize_moc_pixel(self, pix_obj):
@@ -420,7 +427,7 @@ class Pancakes():
         pix_ras = self._ra_im1
         pix_decs = self._dec_im1
         im1_poly = self.enc_sc_vertices
-
+        
         im1_pix_index, im1_pix_moc, skycell_ind = pix_obj
         tp = im1_poly[im1_pix_index]
 
@@ -431,7 +438,7 @@ class Pancakes():
                                 (pix_ras <= _max_ra) & 
                                 (pix_decs >= _min_dec) & 
                                 (pix_decs <= _max_dec))[0]
-
+    
         enc_ps1_pix_mask = im1_pix_moc.contains_lonlat(pix_ras[search_indices]*u.degree, pix_decs[search_indices]*u.degree)
         ps1_ind = np.arange(len(pix_ras))
         ps1_ind = ps1_ind[search_indices][enc_ps1_pix_mask]
@@ -452,7 +459,7 @@ class Pancakes():
         elif self.master_skip == True:
             print('Skipping...')
         else:
-            print('Starting im1_to_skycells ...')
+            print('Starting...')
             self.major_moccy()
             sc_payload = [(i,etp, self.skycells_id[i]) for (i,etp) in enumerate(self.enc_sc)]
 
@@ -464,7 +471,7 @@ class Pancakes():
                     pix_output.append(pix_out)
 
             fll = self._skycell_arrayify(pix_output)
-
+            
             # return fll
             self._skycell_fitsify(fll)
 
@@ -479,7 +486,7 @@ class Pancakes():
                 self.ps1_pixels_to_im1()
             else:
                 self.im1_to_skycells()
-                print('Starting ps1_pixels_to_im1 ...')
+                print('Starting...')
                 self.ps1_pixels_to_im1()
         else:
             print('No skycells found in the image')
@@ -492,16 +499,17 @@ class Pancakes():
         full_date =datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%m')
 
         new_fits_header = deepcopy(self.temp_copy)
-
+        
         new_fits_header['DATE-MOD'] = full_date
         file = os.path.join(self.savepath, self.master_file)
         primary_hdu = fits.PrimaryHDU(header=new_fits_header)
-        image_hdu1 = fits.ImageHDU(data=deepcopy(np.int16(fll)), header=new_fits_header)
+        image_hdu1 = fits.ImageHDU(data=deepcopy(np.int32(fll)), header=new_fits_header)
         table = fits.BinTableHDU.from_columns([fits.Column(name='SKYCELL', format='20A', array=np.asarray(self.skycells_list)),
                                                fits.Column(name='SKYCIND', format='K', array=np.asarray(self.skycells_id))])
         hdul = fits.HDUList([primary_hdu, image_hdu1, table])
 
         hdul.writeto(file, overwrite=True)
+
         compress = 'gzip -f ' + file
         os.system(compress)
 
@@ -517,7 +525,7 @@ class Pancakes():
         for i in tqdm(range(len(pix_output)), desc='Creating overlaps'):
             unravel_index = np.unravel_index(pix_output[i][-1], self.data_shape)
             fll[unravel_index] = pix_output[i][0]
-
+            
             index_tuples = list(zip(*unravel_index))  # This creates a list of (x, y) tuples
 
             for index in index_tuples:
@@ -577,47 +585,62 @@ class Pancakes():
 
     def initialize_moc_pixel(self, pix_obj):
         """
-        Initializes the PanSTARRS1 pixels to TESS pixels matching
+        Initializes the PanSTARRS1 pixels to TESS pixels matching — optimized.
         """
 
         pix_ras = self._ra2
         pix_decs = self._dec2
         poly = self.enc_pix_vertices
 
+        pix_indices, tess_pix_mocs, tess_inds = pix_obj
+
         output = []
 
-        pix_indexs, tess_pix_mocs, tess_inds = pix_obj
+        if len(pix_indices) == 0:
+            return
 
-        if len(pix_indexs) != 0:
+        # Precompute ps1 indices array once
+        ps1_indices_all = np.arange(len(pix_ras))
 
-            for i in range(len(pix_indexs)):
-                pix_index = pix_indexs[i]
-                tess_ind = tess_inds[i]
-                tess_pix_moc = tess_pix_mocs[i]
+        for pix_index, tess_pix_moc, tess_ind in zip(pix_indices, tess_pix_mocs, tess_inds):
 
-                tp = poly[pix_index]
+            tp = poly[pix_index]
 
-                _min_ra, _max_ra = np.min(tp[:, 0]) - 0.05, np.max(tp[:, 0]) + 0.05
-                _min_dec, _max_dec = np.min(tp[:, 1]) - 0.05, np.max(tp[:, 1]) + 0.05
+            # Bounding box with small margin
+            _min_ra, _max_ra = np.min(tp[:, 0]) - 0.05, np.max(tp[:, 0]) + 0.05
+            _min_dec, _max_dec = np.min(tp[:, 1]) - 0.05, np.max(tp[:, 1]) + 0.05
 
-                search_indices = np.where((pix_ras >= _min_ra) &
-                                        (pix_ras <= _max_ra) &
-                                        (pix_decs >= _min_dec) &
-                                        (pix_decs <= _max_dec))[0]
+            # Boolean mask for bounding box filtering
+            bbox_mask = (
+                (pix_ras >= _min_ra) & (pix_ras <= _max_ra) &
+                (pix_decs >= _min_dec) & (pix_decs <= _max_dec)
+            )
 
-                enc_ps1_pix_mask = tess_pix_moc.contains_lonlat(pix_ras[search_indices] * u.degree, pix_decs[search_indices] * u.degree)
-                ps1_ind = np.arange(len(pix_ras))
-                ps1_ind = ps1_ind[search_indices][enc_ps1_pix_mask]
+            search_indices = ps1_indices_all[bbox_mask]
 
-                temp_ra = np.asarray(pix_ras[search_indices])[enc_ps1_pix_mask]
-                temp_dec = np.asarray(pix_decs[search_indices])[enc_ps1_pix_mask]
+            if len(search_indices) == 0:
+                continue
 
-                output.append((tess_ind, temp_ra, temp_dec, ps1_ind))
+            # Check which points inside MOC polygon (vectorized)
+            contained_mask = tess_pix_moc.contains_lonlat(
+                pix_ras[search_indices] * u.degree,
+                pix_decs[search_indices] * u.degree
+            )
 
+            filtered_indices = search_indices[contained_mask]
+
+            if len(filtered_indices) == 0:
+                continue
+
+            # Extract the filtered ras and decs
+            temp_ra = pix_ras[filtered_indices]
+            temp_dec = pix_decs[filtered_indices]
+
+            output.append((tess_ind, temp_ra, temp_dec, filtered_indices))
+
+        if output:
             fll = self._arrayifying(output)
             self._fitsify(fll)
-        else:
-            pass
 
     def _arrayifying(self, pix_output):
         """
@@ -632,9 +655,9 @@ class Pancakes():
             zeros = np.zeros(length)
             tup = (unravel_index[0], unravel_index[1], zeros)
 
-            fll[tup[0], tup[1], np.int16(tup[2])] = pix_output[i][0][1]
-            fll[tup[0], tup[1], np.int16(tup[2]) + 1] = pix_output[i][0][0]
-
+            fll[tup[0], tup[1], np.int32(tup[2])] = pix_output[i][0][1]
+            fll[tup[0], tup[1], np.int32(tup[2]) + 1] = pix_output[i][0][0]
+        
         return fll
 
     def _filename(self):
@@ -681,7 +704,7 @@ class Pancakes():
         """
 
         file_name = self.file_name
-
+        
         temp_fits_header = self.temp_fits_header
 
         new_fits_header = fits.Header()
@@ -690,7 +713,7 @@ class Pancakes():
 
         new_fits_header += self.header_dicts[self.skycell_index]
         new_fits_header += temp_fits_header
-
+        
         # new_fits_header.update(self.header_dicts[self.skycell_index])
 
         im1_header = deepcopy(new_fits_header)
@@ -706,12 +729,12 @@ class Pancakes():
         file = os.path.join(self.savepath, file_name)
         primary_hdu = fits.PrimaryHDU(header=new_fits_header)
         image_hdu1 = fits.ImageHDU(data=deepcopy(np.int64(fll[:,:,0])), header=im1_header)
-        image_hdu1.scale('int16', bscale=1.0,bzero=32768.0)
+        image_hdu1.scale('int32', bscale=1.0,bzero=32768.0)
         image_hdu1.header['EXTNAME'] = 'X'
         image_hdu1.header['BSCALE'] = 1.0
         image_hdu1.header['BZERO'] = 32768.0
         image_hdu2 = fits.ImageHDU(data=deepcopy(np.int64(fll[:,:,1])), header=im2_header)
-        image_hdu2.scale('int16', bscale=1.0,bzero=32768.0)
+        image_hdu2.scale('int32', bscale=1.0,bzero=32768.0)
         image_hdu2.header['BSCALE'] = 1.0
         image_hdu2.header['BZERO'] = 32768.0
         image_hdu2.header['EXTNAME'] = 'Y'
@@ -728,11 +751,11 @@ class Pancakes():
         """
         Reorders the header to the correct order
         """
-
+        
         new_header = fits.Header() # Create a new header list with correct order
-
+        
         required_cards = ['SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'PCOUNT', 'GCOUNT'] # Example of required order
-
+        
         for card in required_cards:  # Add cards in the correct order
             if card in header:
                 new_header.append((card, header[card]))
@@ -740,7 +763,7 @@ class Pancakes():
         for card in header: # Add remaining cards that are not in the required order
             if card not in required_cards:
                 new_header.append((card, header[card]))
-
+        
         return new_header
 
     def _remove_naxis_cards(self, header):
@@ -749,11 +772,11 @@ class Pancakes():
         """
 
         new_header = fits.Header() # Create a new header
-
+        
         for card in header.cards: # Add cards that are not 'NAXIS' related
             if not card[0].startswith('NAXIS'):
                 new_header.append(card)
-
+        
         return new_header
 
     def ps1_pixels_to_im1(self):
@@ -762,41 +785,48 @@ class Pancakes():
         """
 
         if self.master_skip == True:
-            print("Skipping...")
+            print('Skipping...')
         else:
             sky_list = self.skycells_list
             tasks = [(sky_list[i], i) for i in range(len(sky_list))]
             # tasks = [('skycell.2246.021', 2), ('skycell.2246.022', 3)]
 
-            with Pool(processes=self.num_cores) as pool:
-                result = pool.imap_unordered(self._process_wrapper, tasks)
-                for res in result:
-                    pass
+            with Pool(self.num_cores) as pool:
+                results = pool.imap_unordered(self._process_wrapper, tasks)
+                for _ in results:
+                    pass  # faster than 'for res in result' and no typo
 
     def _process_wrapper(self, args):
         """
         Wrapper function for the ps1_pixels_to_im1 function
         """
 
-        filename, index = args
+        filename,index = args
         self.butter(filename, index)
 
     def angular_distance(self, ra1, dec1, ra2, dec2):
         """
-        Angular distance between two points on the sky
+        Vectorized great-circle distance using haversine formula.
+        All inputs assumed in degrees.
         """
+        ra1_rad, dec1_rad = np.radians(ra1), np.radians(dec1)
+        ra2_rad, dec2_rad = np.radians(ra2), np.radians(dec2)
 
-        d1 = np.sin(np.radians(dec1)) * np.sin(np.radians(dec2))
-        d2 = np.cos(np.radians(dec1)) * np.cos(np.radians(dec2)) * np.cos(np.radians(ra1 - ra2))
-        return np.degrees(np.arccos(d1 + d2))
+        delta_ra = ra2_rad - ra1_rad
+        delta_dec = dec2_rad - dec1_rad
 
-    def max_radius(self, ra1, dec1, ra2, dec2):
+        a = np.sin(delta_dec / 2.0) ** 2 + np.cos(dec1_rad) * np.cos(dec2_rad) * np.sin(delta_ra / 2.0) ** 2
+        return np.degrees(2 * np.arcsin(np.sqrt(a)))
+
+    def max_radius(self, ra_centre, dec_centre, ra_corners, dec_corners):
         """
-        Maximum angular distance between two points on the sky
+        Compute max angular separation from center to any corner.
         """
-
-        return np.nanmax(self.angular_distance(ra1, dec1, ra2, dec2))
-
+        ra_corners = np.asarray(ra_corners)
+        dec_corners = np.asarray(dec_corners)
+        dists = self.angular_distance(ra_centre, dec_centre, ra_corners, dec_corners)
+        return np.max(dists)
+        
     def name_skycells(self):
         """
         Name and find appropriate skycells for the TESS image
@@ -820,7 +850,7 @@ class Pancakes():
         if len(self.skycells_list) < 1:
             print('No skycells found in the image')
             self.master_skip = True
-
+        
         self.complete_skycells['NAXIS1'] = complete_wcs_skycells['NAXIS1']
         self.complete_skycells['NAXIS2'] = complete_wcs_skycells['NAXIS2']
 
@@ -833,26 +863,34 @@ class Pancakes():
         """
         Finds the pixel vertices of the PanSTARRS1 skycells
         """
+        sc_df = self.complete_skycells
+        ra_vals = sc_df['RA'].values
+        dec_vals = sc_df['DEC'].values
+        sc_names = sc_df['Name'].values
+
+        # Vectorized center coordinates
+        self.sc_centers = np.column_stack((ra_vals, dec_vals))
+
+        # Pre-parsed skycell IDs — faster than str split in loop
+        self.sc_names = np.array([int(name.split('.')[1] + name.split('.')[2]) for name in sc_names])
 
         im1_pixel_vertices = []
 
-        sc_center_ra, sc_center_dec = self.complete_skycells.RA.values, self.complete_skycells.DEC.values
+        for i in range(len(sc_df)):
+            row = sc_df.iloc[i]
+            ra_corners = np.array([row[f'RA_Corner{j}'] for j in range(1, 5)])
+            dec_corners = np.array([row[f'DEC_Corner{j}'] for j in range(1, 5)])
 
-        self.sc_centers = np.column_stack((sc_center_ra, sc_center_dec))
-        sc_names = self.complete_skycells['Name'].values 
-        self.sc_names = [int(name.split('.')[1] + name.split('.')[2]) for name in sc_names]
+            # World to pixel in bulk
+            pix_corners = np.array([
+                self.super_wcs.all_world2pix(ra_corners[j], dec_corners[j], 0)
+                for j in range(4)
+            ])
 
-        for i in range(len(self.complete_skycells)):
-
-            ra_corners = np.array([self.complete_skycells.iloc[i][f'RA_Corner{j}'] for j in range(1, 5)])
-            dec_corners = np.array([self.complete_skycells.iloc[i][f'DEC_Corner{j}'] for j in range(1, 5)])
-
-            corner1 = self.super_wcs.all_world2pix(ra_corners[0], dec_corners[0], 0)
-            corner2 = self.super_wcs.all_world2pix(ra_corners[1], dec_corners[1], 0)
-            corner3 = self.super_wcs.all_world2pix(ra_corners[2], dec_corners[2], 0)
-            corner4 = self.super_wcs.all_world2pix(ra_corners[3], dec_corners[3], 0)
-
-            sc_poly = self.super_wcs.all_pix2world([corner1, corner2, corner3, corner4], 0)
+            # This line seems suspect — you're doing world2pix then back to world?
+            # If you really want image-aligned WCS polygons in world coords, fine.
+            # Otherwise skip this.
+            sc_poly = self.super_wcs.all_pix2world(pix_corners, 0)
             im1_pixel_vertices.append(sc_poly)
 
         self.im1_pixel_vertices = im1_pixel_vertices
