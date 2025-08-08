@@ -1,6 +1,7 @@
-import pandas as pd
 import os
+import argparse
 import requests
+import pandas as pd
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
@@ -32,19 +33,20 @@ def get_img_name(skycell_name, filters="rizy", home_dir="./", domask=False):
                 # return "Not Found"
 
 
-def download_images_for_row(row):
+def download_images_for_row(row, save_path: str, filters: str = "rizy", download_masks: bool = True):
     """Download images for a single row"""
-    save_path = "data/ps1_skycells/"
     if row is not None:
         try:
-            get_img_name(row, filters="rizy", home_dir=save_path, domask=False)
-            get_img_name(row, filters="rizy", home_dir=save_path, domask=True)
+            get_img_name(row, filters=filters, home_dir=save_path, domask=False)
+            if download_masks:
+                get_img_name(row, filters=filters, home_dir=save_path, domask=True)
         except Exception as e:
             print(f"Error downloading image for row: {e}")
 
 
-skycells_df = pd.read_csv("data/SkyCells/skycell_s20_c11.csv")
-unique_ps1_images = skycells_df["Name"].unique()
+# skycells_df = pd.read_csv("data/mapping_output/sector_0049/ccd_10/tess_s0049_10_master_skycells_list.csv")
+skycells_df = pd.read_csv("data/mapping_output/sector_0076/ccd_8/tess_s0076_8_master_skycells_list.csv")
+unique_ps1_images = skycells_df["NAME"].unique()
 unique_ps1_images.sort()
 # unique_ps1_images = unique_ps1_images[:1]
-Parallel(n_jobs=12)(delayed(download_images_for_row)(row) for row in tqdm(unique_ps1_images, desc="Downloading images"))
+Parallel(n_jobs=60)(delayed(download_images_for_row)(row) for row in tqdm(unique_ps1_images, desc="Downloading images"))
