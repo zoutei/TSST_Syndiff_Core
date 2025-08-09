@@ -9,29 +9,301 @@ Author: Generated from optimization notebook analysis
 Version: 2.0
 """
 
-import numpy as np
-import pandas as pd
-from astropy.io import fits
-from astropy.wcs import WCS
-from astropy.coordinates import SkyCoord
-import astropy.units as u
-from mocpy import MOC
-from numba import jit
+# Standard library imports
 import os
 import time
-from datetime import datetime
-from copy import deepcopy
-from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import warnings
-from astropy.wcs import FITSFixedWarning
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime
+
+import astropy.units as u
+import numpy as np
+import pandas as pd
+from astropy.coordinates import SkyCoord
+from astropy.io import fits
 from astropy.io.fits.verify import VerifyWarning
+from astropy.wcs import WCS, FITSFixedWarning
+from mocpy import MOC
+from numba import jit
+from shapely.geometry import Polygon
+from tqdm import tqdm
 
 # Suppress common warnings
 warnings.simplefilter("ignore", category=VerifyWarning)
 warnings.filterwarnings("ignore", category=FITSFixedWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# ============================================================================
+# PADDING AND SKYCELL UTILITIES
+# ============================================================================
+
+
+@dataclass
+class PaddingRequirements:
+    """Flags indicating which sides/corners require padding based on TESS mapping."""
+
+    top: bool = False
+    bottom: bool = False
+    left: bool = False
+    right: bool = False
+    top_left: bool = False
+    top_right: bool = False
+    bottom_left: bool = False
+    bottom_right: bool = False
+
+    def any_needed(self) -> bool:
+        """Check if any side needs padding."""
+        return any([self.top, self.bottom, self.left, self.right, self.top_left, self.top_right, self.bottom_left, self.bottom_right])
+
+    def good_side_fail(self):
+        """Check if padding is needed for sides that should never need it."""
+        return any([self.bottom, self.left, self.top_left, self.bottom_left, self.bottom_right])
+
+    def to_list(self):
+        """Convert to list of boolean values."""
+        return [self.top, self.right, self.top_right, self.bottom, self.left, self.bottom_left, self.bottom_right, self.top_left]
+
+    def from_list(self, padding_list):
+        """Set values from a list of booleans."""
+        if len(padding_list) != 8:
+            raise ValueError("Padding list must have exactly 8 elements")
+
+        self.top = padding_list[0]
+        self.right = padding_list[1]
+        self.top_right = padding_list[2]
+        self.bottom = padding_list[3]
+        self.left = padding_list[4]
+        self.bottom_left = padding_list[5]
+        self.bottom_right = padding_list[6]
+        self.top_left = padding_list[7]
+
+        return self
+
+
+def get_projection_cell_id(skycell_name):
+    """
+    Parse skycell name to extract projection, cell, y, and x coordinates.
+
+    Args:
+        skycell_name (str): Skycell name in format 'skycell.projection.cell'
+
+    Returns:
+        tuple: (projection, cell, y, x)
+    """
+    _, projection, cell = skycell_name.split(".")
+    if _ != "skycell":
+        print("Invalid skycell name format")
+    projection = int(projection)
+    y = int(cell[1])
+    x = int(cell[2])
+    return projection, cell, y, x
+
+
+def check_tess_mapping_padding(mapping_data: np.ndarray, pad_distance: int = 500, edge_exclusion: int = 10) -> PaddingRequirements:
+    """
+    Analyze a TESS mapping FITS to determine which borders require padding.
+
+    Expects that pixels mapped to this skycell are non-zero; edges with any non-zero within
+    the first/last pad_distance (excluding a small inner edge) are flagged for padding.
+
+    Args:
+        mapping_data (np.ndarray): 2D mapping array
+        pad_distance (int): Distance from edge to check for padding requirements
+        edge_exclusion (int): Pixels to exclude from very edge
+
+    Returns:
+        PaddingRequirements: Object indicating which sides need padding
+    """
+    padding = PaddingRequirements()
+    # Top
+    padding.top = bool(np.any(mapping_data[-(pad_distance + edge_exclusion) : -edge_exclusion, edge_exclusion:-edge_exclusion] != -1))
+    # Bottom
+    padding.bottom = bool(np.any(mapping_data[edge_exclusion : pad_distance + edge_exclusion, edge_exclusion:-edge_exclusion] != -1))
+    # Left
+    padding.left = bool(np.any(mapping_data[edge_exclusion:-edge_exclusion, edge_exclusion : pad_distance + edge_exclusion] != -1))
+    # Right
+    padding.right = bool(np.any(mapping_data[edge_exclusion:-edge_exclusion, -(pad_distance + edge_exclusion) : -edge_exclusion] != -1))
+    # Corners
+    padding.top_left = bool(np.any(mapping_data[-(pad_distance + edge_exclusion) : -edge_exclusion, edge_exclusion : pad_distance + edge_exclusion] != -1))
+    padding.top_right = bool(np.any(mapping_data[-(pad_distance + edge_exclusion) : -edge_exclusion, -(pad_distance + edge_exclusion) : -edge_exclusion] != -1))
+    padding.bottom_left = bool(np.any(mapping_data[edge_exclusion : pad_distance + edge_exclusion, edge_exclusion : pad_distance + edge_exclusion] != -1))
+    padding.bottom_right = bool(np.any(mapping_data[edge_exclusion : pad_distance + edge_exclusion, -(pad_distance + edge_exclusion) : -edge_exclusion] != -1))
+    return padding
+
+
+def get_padding_corners(skycell_row, ps1_wcs, padding_side, pad_size=500, edge_exclusion=10):
+    """
+    Get the corners of a padding region for a given skycell and padding side.
+
+    Args:
+        skycell_row: Row from the skycell DataFrame
+        padding_side: One of 'top', 'right', 'top_right', etc.
+        ps1_wcs: Optional WCS object (to avoid recreation)
+        pad_size: Size of the padding in pixels
+        edge_exclusion: Overlap with the original skycell in pixels
+
+    Returns:
+        list: List of [RA, DEC] corner coordinates for the padding region
+    """
+    # Get dimensions needed for padding calculations
+    naxis1 = skycell_row["NAXIS1"]
+    naxis2 = skycell_row["NAXIS2"]
+
+    # Define coordinates for each padding region
+    # Each region extends pad_size pixels outside the edge and edge_exclusion pixels inside
+    if padding_side == "top":
+        x_coords = [0, naxis1, naxis1, 0]
+        y_coords = [naxis2 - edge_exclusion, naxis2 - edge_exclusion, naxis2 + pad_size, naxis2 + pad_size]
+    elif padding_side == "right":
+        x_coords = [naxis1 - edge_exclusion, naxis1 + pad_size, naxis1 + pad_size, naxis1 - edge_exclusion]
+        y_coords = [0, 0, naxis2, naxis2]
+    elif padding_side == "bottom":
+        x_coords = [0, naxis1, naxis1, 0]
+        y_coords = [-pad_size, -pad_size, edge_exclusion, edge_exclusion]
+    elif padding_side == "left":
+        x_coords = [-pad_size, edge_exclusion, edge_exclusion, -pad_size]
+        y_coords = [0, 0, naxis2, naxis2]
+    elif padding_side == "top_right":
+        x_coords = [naxis1 - edge_exclusion, naxis1 + pad_size, naxis1 + pad_size, naxis1 - edge_exclusion]
+        y_coords = [naxis2 - edge_exclusion, naxis2 - edge_exclusion, naxis2 + pad_size, naxis2 + pad_size]
+    elif padding_side == "bottom_right":
+        x_coords = [naxis1 - edge_exclusion, naxis1 + pad_size, naxis1 + pad_size, naxis1 - edge_exclusion]
+        y_coords = [-pad_size, -pad_size, edge_exclusion, edge_exclusion]
+    elif padding_side == "bottom_left":
+        x_coords = [-pad_size, edge_exclusion, edge_exclusion, -pad_size]
+        y_coords = [-pad_size, -pad_size, edge_exclusion, edge_exclusion]
+    elif padding_side == "top_left":
+        x_coords = [edge_exclusion, -pad_size, -pad_size, edge_exclusion]
+        y_coords = [naxis2 - edge_exclusion, naxis2 - edge_exclusion, naxis2 + pad_size, naxis2 + pad_size]
+        x_coords = [-pad_size, edge_exclusion, edge_exclusion, -pad_size]
+        y_coords = [naxis2 - edge_exclusion, naxis2 - edge_exclusion, naxis2 + pad_size, naxis2 + pad_size]
+    else:
+        raise ValueError(f"Unknown padding side: {padding_side}")
+
+    # Convert pixel coordinates to world coordinates (RA, DEC)
+    world_coords = ps1_wcs.wcs_pix2world(np.vstack([x_coords, y_coords]).T, 0)
+
+    # Return corners in [RA, DEC] format
+    return [[ra, dec] for ra, dec in world_coords]
+
+
+def get_padding_center(corners):
+    """Calculate the center point of a padding region."""
+    ra_avg = np.mean([corner[0] for corner in corners])
+    dec_avg = np.mean([corner[1] for corner in corners])
+    return ra_avg, dec_avg
+
+
+def calculate_distance(ra1, dec1, ra2, dec2):
+    """Calculate angular distance between two points in degrees."""
+    c1 = SkyCoord(ra1 * u.degree, dec1 * u.degree, frame="icrs")
+    c2 = SkyCoord(ra2 * u.degree, dec2 * u.degree, frame="icrs")
+    return c1.separation(c2).degree
+
+
+def calculate_overlap(region1, region2):
+    """Calculate the percentage of region1 covered by region2."""
+    try:
+        intersection = region1.intersection(region2)
+        if intersection.is_empty:
+            return 0.0
+        return (intersection.area / region1.area) * 100.0
+    except Exception as e:
+        print(f"Error calculating overlap: {e}")
+        return 0.0
+
+
+def find_best_padding_skycell(target_skycell, padding_corners, all_skycells):
+    """
+    Find the best skycell for padding based on coverage and proximity.
+
+    Args:
+        target_skycell: The skycell that needs padding
+        padding_corners: The corners of the padding region
+        all_skycells: DataFrame of all available skycells
+
+    Returns:
+        dict: Results containing best skycell(s) info and coverage analysis
+    """
+    # Create padding region polygon
+    padding_region = Polygon(padding_corners)
+    padding_center_ra, padding_center_dec = get_padding_center(padding_corners)
+
+    # PS1 skycell width in degrees (approximate)
+    ps1_width = 0.4  # degrees
+
+    # Calculate search radius (diagonal of skycell * sqrt(2))
+    search_radius = (ps1_width / 2) * np.sqrt(2)
+
+    # Find all potentially overlapping skycells
+    overlapping_candidates = []
+
+    for _, candidate in all_skycells.iterrows():
+        # Skip the target skycell itself
+        if candidate["NAME"] == target_skycell["NAME"]:
+            continue
+
+        # Calculate center-to-center distance
+        candidate_center_ra = np.mean([candidate[f"RA_Corner{i}"] for i in range(1, 5)])
+        candidate_center_dec = np.mean([candidate[f"DEC_Corner{i}"] for i in range(1, 5)])
+        distance = calculate_distance(padding_center_ra, padding_center_dec, candidate_center_ra, candidate_center_dec)
+
+        # Filter by distance to reduce computation
+        if distance < search_radius:
+            # Create candidate polygon
+            candidate_corners = [[candidate[f"RA_Corner{i}"], candidate[f"DEC_Corner{i}"]] for i in range(1, 5)]
+            candidate_polygon = Polygon(candidate_corners)
+
+            # Calculate overlap
+            coverage = calculate_overlap(padding_region, candidate_polygon)
+
+            if coverage > 0:
+                overlapping_candidates.append({"skycell_id": candidate["NAME"], "projection": candidate["projection"], "coverage": coverage, "distance": distance, "polygon": candidate_polygon})
+
+    # Sort by coverage (primary) and distance (secondary)
+    overlapping_candidates.sort(key=lambda x: (-x["coverage"], x["distance"]))
+
+    if not overlapping_candidates:
+        return {"status": "no_overlap", "best_match": None, "coverage": 0, "combined_solutions": []}
+
+    # Check if we have 100% coverage with the best candidate
+    if overlapping_candidates[0]["coverage"] >= 99.9:  # Allow for small numerical errors
+        return {"status": "full_coverage", "best_match": overlapping_candidates[0]["skycell_id"], "best_match_proj": overlapping_candidates[0]["projection"], "coverage": overlapping_candidates[0]["coverage"], "distance": overlapping_candidates[0]["distance"], "combined_solutions": []}
+
+    # Try to find combinations that provide full coverage
+    combined_solutions = []
+
+    # Try all pairs of candidates
+    for i in range(len(overlapping_candidates)):
+        for j in range(i + 1, len(overlapping_candidates)):
+            combined_polygon = overlapping_candidates[i]["polygon"].union(overlapping_candidates[j]["polygon"])
+            combined_coverage = calculate_overlap(padding_region, combined_polygon)
+
+            if combined_coverage >= 99.9:  # Allow for small numerical errors
+                combined_solutions.append({"skycells": [overlapping_candidates[i]["skycell_id"], overlapping_candidates[j]["skycell_id"]], "projections": [overlapping_candidates[i]["projection"], overlapping_candidates[j]["projection"]], "coverage": combined_coverage, "avg_distance": (overlapping_candidates[i]["distance"] + overlapping_candidates[j]["distance"]) / 2})
+
+    # Sort combined solutions by average distance
+    combined_solutions.sort(key=lambda x: x["avg_distance"])
+
+    return {"status": "partial_coverage" if not combined_solutions else "combined_coverage", "best_match": overlapping_candidates[0]["skycell_id"], "best_match_proj": overlapping_candidates[0]["projection"], "coverage": overlapping_candidates[0]["coverage"], "distance": overlapping_candidates[0]["distance"], "combined_solutions": combined_solutions}
+
+
+def parse_special_padding_flags(flags_str):
+    """Parse the special_padding_flags string into a list of booleans."""
+    if not isinstance(flags_str, str):
+        return [False] * 8
+
+    try:
+        flags = eval(flags_str)
+        if isinstance(flags, list) and len(flags) == 8:
+            return flags
+        return [False] * 8
+    except Exception:
+        return [False] * 8
 
 
 # ============================================================================
@@ -125,6 +397,34 @@ def calculate_radec_corners_numba(buffer, naxis1, naxis2, crval1, crval2, crpix1
         y = np.array([buffer, naxis2[i] - buffer, naxis2[i] - buffer, buffer])
         for c in range(4):
             ra_dec[i, c, 0], ra_dec[i, c, 1] = calculate_radec(x[c], y[c], crval1[i], crval2[i], crpix1[i], crpix2[i], pc1_1[i], pc1_2[i], pc2_1[i], pc2_2[i], cdelt1[i], cdelt2[i])
+    return ra_dec
+
+
+@jit(nopython=True)
+def calculate_radec_corners_shift_numba(buffer_large, buffer_small, buffer_normal, cell_x, cell_y, naxis1, naxis2, crval1, crval2, crpix1, crpix2, pc1_1, pc1_2, pc2_1, pc2_2, cdelt1, cdelt2):
+    # Check array shapes
+    if not (naxis1.shape == naxis2.shape == crval1.shape == crval2.shape == crpix1.shape == crpix2.shape == pc1_1.shape == pc1_2.shape == pc2_1.shape == pc2_2.shape == cdelt1.shape == cdelt2.shape):
+        raise ValueError("All input arrays must have the same shape")
+
+    ra_dec = np.empty((crval1.shape[0], 4, 2), dtype=np.float64)
+    for i in range(crval1.shape[0]):
+        if cell_x[i] == 0:
+            x = np.array([buffer_normal, buffer_normal, naxis1[i] - buffer_small, naxis1[i] - buffer_small])
+        elif cell_x[i] == 9:
+            x = np.array([buffer_large, buffer_large, naxis1[i] - buffer_normal, naxis1[i] - buffer_normal])
+        else:
+            x = np.array([buffer_large, buffer_large, naxis1[i] - buffer_small, naxis1[i] - buffer_small])
+
+        if cell_y[i] == 0:
+            y = np.array([buffer_normal, naxis2[i] - buffer_small, naxis2[i] - buffer_small, buffer_normal])
+        elif cell_y[i] == 9:
+            y = np.array([buffer_large, naxis2[i] - buffer_normal, naxis2[i] - buffer_normal, buffer_large])
+        else:
+            y = np.array([buffer_large, naxis2[i] - buffer_small, naxis2[i] - buffer_small, buffer_large])
+
+        for c in range(4):
+            ra_dec[i, c, 0], ra_dec[i, c, 1] = calculate_radec(x[c], y[c], crval1[i], crval2[i], crpix1[i], crpix2[i], pc1_1[i], pc1_2[i], pc2_1[i], pc2_2[i], cdelt1[i], cdelt2[i])
+
     return ra_dec
 
 
@@ -359,6 +659,28 @@ def calculate_radec_corners(dataframe_skycells, buffer=120):
     )
 
 
+def calculate_radec_corners_shift(dataframe_skycells, buffer_large=450, buffer_small=20, buffer_normal=200):
+    return calculate_radec_corners_shift_numba(
+        buffer_large,
+        buffer_small,
+        buffer_normal,
+        dataframe_skycells["x"].to_numpy(),
+        dataframe_skycells["y"].to_numpy(),
+        dataframe_skycells["NAXIS1"].to_numpy(),
+        dataframe_skycells["NAXIS2"].to_numpy(),
+        dataframe_skycells["CRVAL1"].to_numpy(),
+        dataframe_skycells["CRVAL2"].to_numpy(),
+        dataframe_skycells["CRPIX1"].to_numpy(),
+        dataframe_skycells["CRPIX2"].to_numpy(),
+        dataframe_skycells["PC1_1"].to_numpy(),
+        dataframe_skycells["PC1_2"].to_numpy(),
+        dataframe_skycells["PC2_1"].to_numpy(),
+        dataframe_skycells["PC2_2"].to_numpy(),
+        dataframe_skycells["CDELT1"].to_numpy(),
+        dataframe_skycells["CDELT2"].to_numpy(),
+    )
+
+
 def calculate_radec_center(dataframe_skycells):
     """
     Calculate RA/Dec coordinates for centers of skycells.
@@ -393,7 +715,7 @@ def load_tess_image(tess_file):
         tess_file (str): Path to TESS FITS file
 
     Returns:
-        tuple: (data_shape, wcs, ra_center, dec_center, header, sector, ccd_id)
+        tuple: (data_shape, wcs, ra_center, dec_center, header, sector, camera_id, ccd_id)
     """
     hdul = fits.open(tess_file)
 
@@ -410,12 +732,11 @@ def load_tess_image(tess_file):
     ra_center, dec_center = wcs.all_pix2world(data_shape[1] / 2, data_shape[0] / 2, 0)
 
     sector = tess_file.split("/")[-1].split("-")[1][1:]
-    camera = header["CAMERA"]
-    ccd = header["CCD"]
-    ccd_id = int(int(ccd) + 4 * (int(camera) - 1))
+    camera = int(header["CAMERA"])  # camera_id (1-4)
+    ccd = int(header["CCD"])  # ccd_id (1-4)
 
     hdul.close()
-    return data_shape, wcs, ra_center, dec_center, header, sector, ccd_id
+    return data_shape, wcs, ra_center, dec_center, header, sector, camera, ccd
 
 
 def create_tess_pixel_coordinates(data_shape):
@@ -478,7 +799,7 @@ def find_relevant_skycells(skycell_wcs_df, tess_wcs, data_shape, tess_buffer=150
     return skycell_wcs_df[sc_mask].reset_index(drop=True)
 
 
-def process_tess_to_skycell_mapping(tess_wcs, data_shape, tpix_coord_input, complete_wcs_skycells, buffer=200, n_threads=8):
+def process_tess_to_skycell_mapping(tess_wcs, data_shape, tpix_coord_input, complete_wcs_skycells, edge_buffer_large=410, edge_buffer_small=70, buffer=200, n_threads=8):
     """
     Create optimized mapping from TESS pixels to skycells.
 
@@ -505,7 +826,13 @@ def process_tess_to_skycell_mapping(tess_wcs, data_shape, tpix_coord_input, comp
     complete_wcs_skycells["RA_Corner4"] = sc_corners[:, 3, 0]
     complete_wcs_skycells["DEC_Corner4"] = sc_corners[:, 3, 1]
 
-    enc_sc_vertices = calculate_radec_corners(complete_wcs_skycells, buffer)
+    if "projection" not in complete_wcs_skycells.columns:
+        parsed = complete_wcs_skycells["NAME"].apply(get_projection_cell_id).tolist()
+        cols = pd.DataFrame(parsed, columns=["projection", "cell", "y", "x"])
+        complete_wcs_skycells[["projection", "y", "x", "cell"]] = cols[["projection", "y", "x", "cell"]]
+
+    enc_sc_vertices = calculate_radec_corners_shift(complete_wcs_skycells, edge_buffer_large, edge_buffer_small, buffer)
+    # enc_sc_vertices_noedge = calculate_radec_corners_shift(complete_wcs_skycells, edge_buffer_large, buffer)
 
     # Get TESS pixel RA/Dec coordinates
     _x_tess = tpix_coord_input[:, 1]
@@ -513,14 +840,22 @@ def process_tess_to_skycell_mapping(tess_wcs, data_shape, tpix_coord_input, comp
     _ra_tess, _dec_tess = tess_wcs.all_pix2world(_x_tess, _y_tess, 0)
 
     # Use MOC filtering for efficient polygon-point matching
-    polygons = np.array(enc_sc_vertices)
-    rust_result = MOC.filter_points_in_polygons(polygons=polygons, pix_ras=_ra_tess, pix_decs=_dec_tess, buffer=0.5, max_depth=21, n_threads=n_threads)
+    rust_result = MOC.filter_points_in_polygons(polygons=enc_sc_vertices, pix_ras=_ra_tess, pix_decs=_dec_tess, buffer=0.5, max_depth=21, n_threads=n_threads)
+    # rust_result_noedge = MOC.filter_points_in_polygons(polygons=enc_sc_vertices_noedge, pix_ras=_ra_tess, pix_decs=_dec_tess, buffer=0.5, max_depth=21, n_threads=n_threads)
 
     # Create efficient pixel-to-skycell mapping
     rust_result_flat = np.concatenate([arr for arr in rust_result if len(arr) > 0])
     rust_result_lengths = np.array([len(arr) for arr in rust_result])
 
     tess_pix_skycell_id = create_closest_center_array_numba(rust_result_flat, rust_result_lengths, tess_proj_center_x, tess_proj_center_y, tpix_coord_input, data_shape[0] * data_shape[1])
+
+    # rust_result_noedge_flat = np.concatenate([arr for arr in rust_result_noedge if len(arr) > 0])
+    # rust_result_noedge_lengths = np.array([len(arr) for arr in rust_result_noedge])
+
+    # tess_pix_skycell_id_no_edge = create_closest_center_array_numba(rust_result_noedge_flat, rust_result_noedge_lengths, tess_proj_center_x, tess_proj_center_y, tpix_coord_input, data_shape[0] * data_shape[1])
+
+    # tess_pix_skycell_id = tess_pix_skycell_id_no_edge
+    # tess_pix_skycell_id[tess_pix_skycell_id == -1] = tess_pix_skycell_id_all[tess_pix_skycell_id == -1]
 
     # Remap skycell IDs to consecutive integers
     unique_ids = np.unique(tess_pix_skycell_id[tess_pix_skycell_id != -1])
@@ -648,7 +983,7 @@ def create_fits_header(tess_header, skycell_name=None):
     return fits.Header(dict_for_header)
 
 
-def save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, output_path, sector, ccd_id, overwrite=True):
+def save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, output_path, sector, camera_id, ccd_id, overwrite=True):
     """
     Save PS1-to-TESS pixel mapping as compressed FITS file.
 
@@ -659,11 +994,12 @@ def save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, o
         ps1_header (Header): PS1 skycell header
         output_path (str): Output directory path
         sector (str): TESS sector identifier
-        ccd_id (int): Combined CCD identifier
+        camera_id (int): TESS camera identifier
+        ccd_id (int): TESS CCD identifier
         overwrite (bool): Whether to overwrite existing files
     """
 
-    file_name = f"tess_s{sector}_{ccd_id}_{skycell_name}.fits"
+    file_name = f"tess_s{sector}_{camera_id}_{ccd_id}_{skycell_name}.fits"
 
     # Create headers
     base_header = create_fits_header(tess_header, skycell_name)
@@ -677,7 +1013,7 @@ def save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, o
     mapping_array[mapping_array == -1] = -1  # Ensure -1 for unmapped pixels
 
     # Create FITS file
-    file_path = os.path.join(output_path, f"sector_{sector}", f"ccd_{ccd_id}", file_name)
+    file_path = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name)
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     primary_hdu = fits.PrimaryHDU(header=new_fits_header)
     image_hdu = fits.ImageHDU(data=np.int64(mapping_array), header=new_fits_header_extended)
@@ -695,7 +1031,7 @@ def save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, o
     os.system(compress_cmd)
 
 
-def save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header, data_shape, output_path, sector, ccd_id, overwrite=True):
+def save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header, data_shape, output_path, sector, camera_id, ccd_id, overwrite=True):
     """
     Save master TESS-to-skycell mapping file.
 
@@ -706,14 +1042,15 @@ def save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header
         data_shape (tuple): TESS image shape
         output_path (str): Output directory path
         sector (str): TESS sector identifier
-        ccd_id (int): Combined CCD identifier
+        camera_id (int): TESS camera identifier
+        ccd_id (int): TESS CCD identifier
         overwrite (bool): Whether to overwrite existing files
     """
     # Create filename
-    file_name = f"tess_s{sector}_{ccd_id}_master_pixels2skycells.fits"
-    file_name_csv = f"tess_s{sector}_{ccd_id}_master_skycells_list.csv"
+    file_name = f"tess_s{sector}_{camera_id}_{ccd_id}_master_pixels2skycells.fits"
+    file_name_csv = f"tess_s{sector}_{camera_id}_{ccd_id}_master_skycells_list.csv"
 
-    file_path_csv = os.path.join(output_path, f"sector_{sector}", f"ccd_{ccd_id}", file_name_csv)
+    file_path_csv = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name_csv)
     os.makedirs(os.path.dirname(file_path_csv), exist_ok=True)
     selected_skycells.to_csv(file_path_csv)
 
@@ -722,7 +1059,7 @@ def save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header
     master_header["DATE-MOD"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
 
     # Create FITS file
-    file_path = os.path.join(output_path, f"sector_{sector}", f"ccd_{ccd_id}", file_name)
+    file_path = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name)
     primary_hdu = fits.PrimaryHDU(header=master_header)
 
     # Reshape mapping to 2D and save
@@ -746,19 +1083,19 @@ def process_single_skycell(args):
 
     Args:
         args (tuple): Contains (skycell_row, tess_wcs, tpix_coord_input,
-                      tess_header, output_path, sector, ccd_id, overwrite)
+                      tess_header, output_path, sector, camera_id, ccd_id, overwrite, all_skycells)
 
     Returns:
-        tuple: (success, skycell_name, error_message)
+        tuple: (success, skycell_name, padding_info, error_message)
     """
     try:
-        (skycell_row, tess_wcs, tpix_coord_input, tess_header, output_path, sector, ccd_id, overwrite) = args
+        (skycell_row, tess_wcs, tpix_coord_input, tess_header, output_path, sector, camera_id, ccd_id, pad_distance, edge_exclusion, overwrite, all_skycells) = args
 
         skycell_name = skycell_row["NAME"]
         tess_pix_in_skycell = skycell_row["pixel_indices"]
 
         if len(tess_pix_in_skycell) == 0:
-            return (False, skycell_name, "No TESS pixels in skycell")
+            return (False, skycell_name, {}, "No TESS pixels in skycell")
 
         # Get PS1 header and WCS information directly from skycell_row
         ps1_header, ps1_wcs, ps1_data_shape = get_ps1_wcs_information(skycell_row)
@@ -766,13 +1103,197 @@ def process_single_skycell(args):
         # Process skycell pixel mapping
         mapping_array = process_skycell_pixel_mapping(tess_wcs, tpix_coord_input, ps1_wcs, ps1_data_shape, tess_pix_in_skycell)
 
-        # Save mapping
-        save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, output_path, sector, ccd_id, overwrite)
+        # Analyze padding requirements immediately while we have the mapping array
+        padding_info = analyze_single_skycell_padding(skycell_name, mapping_array, ps1_wcs, skycell_row, all_skycells, pad_distance=pad_distance, edge_exclusion=edge_exclusion)
 
-        return (True, skycell_name, None)
+        # Save mapping
+        save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, output_path, sector, camera_id, ccd_id, overwrite)
+
+        return (True, skycell_name, padding_info, None)
 
     except Exception as e:
-        return (False, skycell_name, str(e))
+        return (False, skycell_name, {}, str(e))
+
+
+def analyze_single_skycell_padding(skycell_name, mapping_array, ps1_wcs, skycell_row, all_skycells, pad_distance=500, edge_exclusion=10):
+    """
+    Analyze padding requirements for a single skycell.
+
+    Args:
+        skycell_name (str): Name of the skycell
+        mapping_array (ndarray): 2D mapping array for this skycell
+        skycell_row (Series, optional): Row data for the skycell, needed for special padding
+        all_skycells (DataFrame, optional): DataFrame with all skycells, needed for special padding
+        pad_distance (int): Distance from edge to check for padding requirements
+        edge_exclusion (int): Pixels to exclude from very edge
+
+    Returns:
+        dict: Dictionary with padding information for this skycell
+    """
+    # Initialize padding info with empty values
+    padding_directions = ["top", "right", "top_right", "bottom", "left", "bottom_left", "bottom_right", "top_left"]
+    padding_info = {f"pad_skycell_{direction}": "" for direction in padding_directions}
+    padding_info.update({"special_padding_needed": False, "edge_pixels_used": False, "good_side_fail": False, "special_padding_flags": [False] * 8})
+
+    # Parse skycell coordinates
+    projection, cell, y, x = get_projection_cell_id(skycell_name)
+
+    # Check for edge pixel usage (stricter check)
+    check_no_edge_bad_pix = check_tess_mapping_padding(mapping_array, pad_distance=10, edge_exclusion=0)
+    if check_no_edge_bad_pix.any_needed():
+        padding_info["edge_pixels_used"] = True
+        print(f"Warning: Edge pixels are being used for {skycell_name}. This is not good")
+
+    # Check padding requirements
+    pad_requirements = check_tess_mapping_padding(mapping_array, pad_distance=pad_distance, edge_exclusion=edge_exclusion)
+
+    # Check if good sides fail
+    if pad_requirements.good_side_fail():
+        if x < 9 and y < 9 and x > 0 and y > 0:
+            padding_info["good_side_fail"] = True
+        else:
+            if x == 0 and y == 0:
+                pass
+            elif y == 0:
+                if not (pad_requirements.bottom or pad_requirements.bottom_left or pad_requirements.bottom_right):
+                    padding_info["good_side_fail"] = True
+            elif x == 0:
+                if not (pad_requirements.left or pad_requirements.top_left or pad_requirements.bottom_left):
+                    padding_info["good_side_fail"] = True
+            elif y == 9:
+                if not (pad_requirements.top or pad_requirements.top_left or pad_requirements.top_right):
+                    padding_info["good_side_fail"] = True
+            elif x == 9:
+                if not (pad_requirements.right or pad_requirements.top_right or pad_requirements.bottom_right):
+                    padding_info["good_side_fail"] = True
+
+    # Track which directions need special padding from other projections
+    special_padding_diff_projection = np.zeros(8, dtype=bool)  # top, right, top_right, bottom, left, bottom_left, bottom_right, top_left
+    padding_list = pad_requirements.to_list()
+
+    # Get padding directions
+    padding_directions = ["top", "right", "top_right", "bottom", "left", "bottom_left", "bottom_right", "top_left"]
+
+    # Get neighboring cells based on position in the grid
+    for i, direction in enumerate(padding_directions):
+        if padding_list[i]:
+            # Default padding approach (within same projection)
+            if direction == "top" and y < 9:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y + 1}{x}"
+            elif direction == "right" and x < 9:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y}{x + 1}"
+            elif direction == "top_right" and y < 9 and x < 9:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y + 1}{x + 1}"
+            elif direction == "bottom" and y > 0:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y - 1}{x}"
+            elif direction == "left" and x > 0:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y}{x - 1}"
+            elif direction == "bottom_left" and y > 0 and x > 0:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y - 1}{x - 1}"
+            elif direction == "bottom_right" and y > 0 and x < 9:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y - 1}{x + 1}"
+            elif direction == "top_left" and y < 9 and x > 0:
+                padding_info[f"pad_skycell_{direction}"] = f"skycell.{projection}.0{y + 1}{x - 1}"
+            else:
+                # This side needs special padding (from different projection)
+                special_padding_diff_projection[i] = True
+
+    # If we need special padding and have the necessary inputs
+    if np.any(special_padding_diff_projection) and skycell_row is not None and all_skycells is not None:
+        padding_info["special_padding_needed"] = True
+        padding_info["special_padding_flags"] = special_padding_diff_projection.tolist()
+
+        # Process each direction that needs special padding
+        for i, direction in enumerate(padding_directions):
+            if special_padding_diff_projection[i]:
+                try:
+                    # Get padding corners for this direction
+                    padding_corners = get_padding_corners(skycell_row, ps1_wcs, direction, pad_size=pad_distance, edge_exclusion=edge_exclusion)
+
+                    # Find the best padding skycell
+                    result = find_best_padding_skycell(skycell_row, padding_corners, all_skycells)
+
+                    # Update padding info based on result
+                    if result["status"] == "full_coverage":
+                        # Single skycell with full coverage
+                        padding_info[f"pad_skycell_{direction}"] = result["best_match"]
+                    elif result["status"] == "combined_coverage" and result["combined_solutions"]:
+                        # Combined solution (take the first one)
+                        solution = result["combined_solutions"][0]
+                        padding_info[f"pad_skycell_{direction}"] = "/".join(solution["skycells"])
+                    elif result["status"] == "partial_coverage":
+                        # Best partial coverage
+                        padding_info[f"pad_skycell_{direction}"] = result["best_match"]
+                except Exception as e:
+                    print(f"Error processing {skycell_name} {direction} padding: {e}")
+                    padding_info[f"pad_skycell_{direction}"] = "None"
+
+    return padding_info
+
+
+def update_skycells_with_padding_info(selected_skycells, padding_results):
+    """
+    Update selected_skycells dataframe with padding information collected from worker threads.
+
+    Args:
+        selected_skycells (DataFrame): DataFrame with skycell information
+        padding_results (dict): Dictionary mapping skycell names to padding info
+
+    Returns:
+        DataFrame: Updated dataframe with padding information
+    """
+
+    # Initialize new columns for padding information
+    padding_columns = ["pad_skycell_top", "pad_skycell_right", "pad_skycell_top_right", "pad_skycell_bottom", "pad_skycell_left", "pad_skycell_bottom_left", "pad_skycell_bottom_right", "pad_skycell_top_left", "special_padding_needed", "edge_pixels_used", "good_side_fail"]
+
+    for col in padding_columns:
+        if col not in selected_skycells.columns:
+            selected_skycells[col] = ""
+
+    # Parse projection, cell, y, x for all skycells if not already done
+    if "projection" not in selected_skycells.columns:
+        parsed = selected_skycells["NAME"].apply(get_projection_cell_id).tolist()
+        cols = pd.DataFrame(parsed, columns=["projection", "cell", "y", "x"])
+        selected_skycells[["projection", "y", "x", "cell"]] = cols[["projection", "y", "x", "cell"]]
+
+    # Update dataframe with padding information from worker results
+    for idx, skycell_row in selected_skycells.iterrows():
+        skycell_name = skycell_row["NAME"]
+
+        if skycell_name in padding_results:
+            padding_info = padding_results[skycell_name]
+
+            # Update dataframe with padding information
+            for key, value in padding_info.items():
+                if key == "special_padding_flags":
+                    # Store as string representation for CSV compatibility
+                    selected_skycells.at[idx, "special_padding_flags"] = str(value)
+                else:
+                    selected_skycells.at[idx, key] = value
+
+    return selected_skycells
+
+
+def save_updated_skycell_csv(selected_skycells, output_path, sector, camera_id, ccd_id):
+    """
+    Save updated CSV file with padding information for processed skycells.
+
+    Args:
+        selected_skycells (DataFrame): Processed skycells with padding info
+        original_skycell_wcs_df (DataFrame): Original skycell WCS dataframe
+        output_path (str): Output directory path
+        sector (str): TESS sector identifier
+        camera_id (int): TESS camera identifier
+        ccd_id (int): TESS CCD identifier
+    """
+    # Start with the selected_skycells dataframe (only processed skycells)
+    # Save updated CSV (only processed skycells)
+    file_name_csv = f"tess_s{sector}_{camera_id}_{ccd_id}_master_skycells_list.csv"
+    file_path_csv = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name_csv)
+    os.makedirs(os.path.dirname(file_path_csv), exist_ok=True)
+
+    selected_skycells.to_csv(file_path_csv, index=False)
+    print(f"Updated skycell CSV saved to: {file_path_csv}")
 
 
 # ============================================================================
@@ -780,7 +1301,7 @@ def process_single_skycell(args):
 # ============================================================================
 
 
-def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, buffer=120, tess_buffer=150, n_threads=8, overwrite=True, max_workers=None):
+def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, pad_distance=500, edge_exclusion=10, edge_buffer_large=410, edge_buffer_small=70, buffer=200, tess_buffer=150, n_threads=8, overwrite=True, max_workers=None):
     """
     Main optimized pipeline for processing TESS images with PanSTARRS1 skycells.
 
@@ -810,7 +1331,7 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, buffer
 
     # Load data
     print("Loading TESS image and skycell database...")
-    data_shape, tess_wcs, ra_center, dec_center, tess_header, sector, ccd_id = load_tess_image(tess_file)
+    data_shape, tess_wcs, ra_center, dec_center, tess_header, sector, camera_id, ccd_id = load_tess_image(tess_file)
 
     skycell_wcs_df = pd.read_csv(skycell_wcs_csv)
 
@@ -837,14 +1358,14 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, buffer
 
     # Create TESS-to-skycell mapping
     print("Creating optimized TESS-to-skycell mapping...")
-    selected_skycells, tess_pix_skycell_mapping = process_tess_to_skycell_mapping(tess_wcs, data_shape, tpix_coord_input, complete_wcs_skycells, buffer, n_threads)
+    selected_skycells, tess_pix_skycell_mapping = process_tess_to_skycell_mapping(tess_wcs, data_shape, tpix_coord_input, complete_wcs_skycells, edge_buffer_large=edge_buffer_large, edge_buffer_small=edge_buffer_small, buffer=buffer, n_threads=n_threads)
 
     if np.any(tess_pix_skycell_mapping == -1):
         print("Warning: Some TESS pixels are not mapped to any skycell. This may affect the results.")
 
     # Save master mapping
     print("Saving master TESS-to-skycell mapping...")
-    save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header, data_shape, output_path, sector, ccd_id, overwrite)
+    save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header, data_shape, output_path, sector, camera_id, ccd_id, overwrite)
     print(f"Processing time: {(time.time() - start_time):.2f} seconds")
 
     # Process each skycell
@@ -861,10 +1382,12 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, buffer
     # Prepare arguments for parallel processing
     task_args = []
     for _, skycell_row in selected_skycells.iterrows():
-        args = (skycell_row, tess_wcs, tpix_coord_input, tess_header, output_path, sector, ccd_id, overwrite)
+        args = (skycell_row, tess_wcs, tpix_coord_input, tess_header, output_path, sector, camera_id, ccd_id, pad_distance, edge_exclusion, overwrite, selected_skycells)
         task_args.append(args)
 
     # Process skycells in parallel with progress bar
+    padding_results = {}  # Store padding info for each skycell
+
     if len(task_args) > 0:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
@@ -873,16 +1396,26 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, buffer
             # Process completed tasks with progress bar
             with tqdm(total=len(task_args), desc="Processing skycells") as pbar:
                 for future in as_completed(future_to_args):
-                    success, skycell_name, error_message = future.result()
+                    success, skycell_name, padding_info, error_message = future.result()
 
                     if success:
                         processed_skycells += 1
+                        if padding_info:
+                            padding_results[skycell_name] = padding_info
                     else:
                         skipped_skycells += 1
                         if error_message != "No TESS pixels in skycell":
                             print(f"Error processing skycell {skycell_name}: {error_message}")
 
                     pbar.update(1)
+
+    # Update skycells with padding information collected from worker threads
+    if padding_results:
+        print("\nUpdating skycells with padding information...")
+        selected_skycells = update_skycells_with_padding_info(selected_skycells, padding_results)
+
+        # Save updated CSV with padding information
+        save_updated_skycell_csv(selected_skycells, output_path, sector, camera_id, ccd_id)
 
     total_time = time.time() - start_time
 
@@ -898,16 +1431,15 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, buffer
 
 if __name__ == "__main__":
     # Example usage
-    tess_file = "./development/data/tess/tess2024066160824-s0076-2-4-0271-s_ffic.fits"
-    # tess_file = "./development/data/tess/tess2022057231853-s0049-3-2-0221-s_ffic.fits"
-    # tess_file = "./development/data/tess/tess2018207195942-s0001-4-1-0120-s_ffic.fits"
-    skycell_wcs_csv = "./development/pancakes_opt/data/SkyCells/skycell_wcs.csv"
-    output_path = "./development/data/mapping_output"
+    # tess_file = "./data/tess/tess2024356001253-s0087-1-3-0284-s_ffic.fits"
+    tess_file = "./data/tess_ffi/20_3_3/tess2020019142923-s0020-3-3-0165-s_ffic.fits"
+    skycell_wcs_csv = "./data/SkyCells/skycell_wcs.csv"
+    output_path = "./data/skycell_pixel_mapping"
 
     # Create output directory if it doesn't exist
     os.makedirs(output_path, exist_ok=True)
 
     # Process TESS image
-    results = process_tess_image_optimized(tess_file=tess_file, skycell_wcs_csv=skycell_wcs_csv, output_path=output_path, buffer=120, tess_buffer=150, n_threads=8, overwrite=True, max_workers=8)
- 
+    results = process_tess_image_optimized(tess_file=tess_file, skycell_wcs_csv=skycell_wcs_csv, output_path=output_path, pad_distance=500, edge_exclusion=10, buffer=200, tess_buffer=150, n_threads=8, overwrite=True, max_workers=8)
+
     print(f"Processing results: {results}")
