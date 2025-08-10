@@ -9,13 +9,13 @@ Only this file uses CLI args. Individual step modules expose functions.
 """
 
 import argparse
-from pathlib import Path
 import logging
+from pathlib import Path
 
-from pancakes_v2 import process_tess_image_optimized
 from download_ps1_skycells import download_from_csv
-from process_ps1 import ProcessingConfig, run_ps1_processing_pipeline
 from downsample import run_downsample
+from pancakes_v2 import process_tess_image_optimized
+from process_ps1 import ProcessingConfig, run_ps1_processing_pipeline
 
 
 def derive_paths(sector: int, ccd_id: int, data_root: str) -> dict:
@@ -115,5 +115,3 @@ if __name__ == "__main__":
         overwrite=args.overwrite,
         verbose=args.verbose,
     )
-
-

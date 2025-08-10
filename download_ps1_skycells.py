@@ -1,9 +1,10 @@
 import os
-import argparse
-import requests
+
 import pandas as pd
+import requests
 from joblib import Parallel, delayed
 from tqdm import tqdm
+
 
 def get_img_name(skycell_name, filters="rizy", home_dir="./", domask=False):
     skycell_name = skycell_name.split(".")
@@ -30,7 +31,7 @@ def get_img_name(skycell_name, filters="rizy", home_dir="./", domask=False):
                 # return "Downloaded"
             # else:
             #     print("Failed to download the file " + file_name.split("/")[-1])
-                # return "Not Found"
+            # return "Not Found"
 
 
 def download_images_for_row(row, save_path: str, filters: str = "rizy", download_masks: bool = True):
@@ -45,7 +46,7 @@ def download_images_for_row(row, save_path: str, filters: str = "rizy", download
 
 
 if __name__ == "__main__":
-# Example usage (update paths to your sector/camera/ccd):
+    # Example usage (update paths to your sector/camera/ccd):
     sector = 20
     camera = 3
     ccd = 3
