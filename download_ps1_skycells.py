@@ -44,13 +44,9 @@ def download_images_for_row(row, save_path: str, filters: str = "rizy", download
             print(f"Error downloading image for row: {e}")
 
 
-if __name__ == "__main__":
-# Example usage (update paths to your sector/camera/ccd):
-    sector = 20
-    camera = 3
-    ccd = 3
-    skycells_df = pd.read_csv(f"data/skycell_pixel_mapping/sector_{sector:04d}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_skycells_list.csv")
-    save_path = "data/ps1_skycells"
-    unique_ps1_images = skycells_df["NAME"].unique()
-    unique_ps1_images.sort()
-    Parallel(n_jobs=60)(delayed(download_images_for_row)(row, save_path) for row in tqdm(unique_ps1_images, desc="Downloading images"))
+# skycells_df = pd.read_csv("data/mapping_output/sector_0049/ccd_10/tess_s0049_10_master_skycells_list.csv")
+skycells_df = pd.read_csv("data/mapping_output/sector_0076/ccd_8/tess_s0076_8_master_skycells_list.csv")
+unique_ps1_images = skycells_df["NAME"].unique()
+unique_ps1_images.sort()
+# unique_ps1_images = unique_ps1_images[:1]
+Parallel(n_jobs=60)(delayed(download_images_for_row)(row) for row in tqdm(unique_ps1_images, desc="Downloading images"))
