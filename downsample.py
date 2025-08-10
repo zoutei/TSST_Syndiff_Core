@@ -1,15 +1,10 @@
 import time
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-
-from joblib import Parallel, delayed
-from tqdm import tqdm
 from glob import glob
 
+import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
-
+from joblib import Parallel, delayed
 
 tess_filename = "data/tess/20_3_3/tess2020019135923-s0020-3-3-0165-s_ffic.fits"
 tess_hdu = fits.open(tess_filename)
@@ -71,7 +66,7 @@ def parallel_downsample(registration, ps1_files, reg_sc, ps1_sc, scene, scene_nu
             isums = np.zeros(len(breaks) - 1, dtype=int)
             msums = np.zeros(len(breaks) - 1, dtype=int)
             for i in range(len(breaks) - 1):
-                sums[i] = np.sum(ps1_rav[breaks[i]: breaks[i + 1]])
+                sums[i] = np.sum(ps1_rav[breaks[i] : breaks[i + 1]])
                 isums[i] = breaks[i + 1] - breaks[i]
                 msums[i] = np.sum(ps1_mask_rav[breaks[i] : breaks[i + 1]] != 0)
 
@@ -90,7 +85,7 @@ def run_parallel_downsample(registrations, reg_sc_split, tess_data_shape, ps1_fi
     scene_mask = np.zeros(tess_data_shape, dtype=int)
     for i, reg_sc in enumerate(reg_sc_split):
         scene, scene_num, scene_mask = parallel_downsample(registration=registrations[i], ps1_files=ps1_files, reg_sc=reg_sc, ps1_sc=ps1_sc, scene=scene, scene_num=scene_num, scene_mask=scene_mask)
-        print(f"Processed skycell({i+1}/{len(reg_sc_split)})")
+        print(f"Processed skycell({i + 1}/{len(reg_sc_split)})")
     return scene, scene_num, scene_mask
 
 
@@ -108,4 +103,4 @@ np.save("data/tess_downsampled_detailed.npy", scenes)
 
 scene = np.sum(scenes, axis=0)
 np.save("data/tess_downsampled.npy", scene)
-print(f"Total time taken: {((time.time() - start_time)/60):.2f} minutes")
+print(f"Total time taken: {((time.time() - start_time) / 60):.2f} minutes")
