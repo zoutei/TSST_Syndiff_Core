@@ -12,8 +12,8 @@ Features:
 - Command-line interface
 
 Usage:
-    python zarr_to_fits.py --skycell "rings.v3.skycell.0306.067" --band "r" --output "output.fits"
-    python zarr_to_fits.py --skycell "rings.v3.skycell.0306.067" --band "r" --mask --output "output_mask.fits"
+    python zarr_to_fits.py --skycell "skycell.2556.080" --band "r" --output "output.fits"
+    python zarr_to_fits.py --skycell "skycell.2556.080" --band "r" --mask --output "output_mask.fits"
 """
 
 import argparse
@@ -87,10 +87,11 @@ def extract_array_from_zarr(zarr_path: Path, skycell_name: str, band: str, is_ma
         # Extract data
         data_array = skycell_group[array_name][:]
 
-        # Extract header if available
+        # Extract header if available - now look at array level first, then fallback to skycell level
         header_string = None
-        if hasattr(skycell_group, "attrs") and "header" in skycell_group.attrs:
-            header_string = skycell_group.attrs["header"]
+        if hasattr(skycell_group[array_name], "attrs") and "header" in skycell_group[array_name].attrs:
+            # Preferred: header stored at array level (new format)
+            header_string = skycell_group[array_name].attrs["header"]
 
         logging.info(f"Successfully extracted {array_name} from {skycell_name}")
         logging.info(f"Data shape: {data_array.shape}, dtype: {data_array.dtype}")
@@ -115,15 +116,6 @@ def reconstruct_fits_header(header_string: Optional[str], band: str, is_mask: bo
             header = fits.Header()
     else:
         header = fits.Header()
-
-    # Add/update basic keywords
-    header["EXTNAME"] = f"{band.upper()}_MASK" if is_mask else band.upper()
-    header["BAND"] = band.upper()
-    header["ISMASK"] = is_mask
-
-    # Add processing information
-    header["COMMENT"] = "Extracted from Zarr store"
-    header["HISTORY"] = "Data processed through zarr_to_fits.py"
 
     return header
 

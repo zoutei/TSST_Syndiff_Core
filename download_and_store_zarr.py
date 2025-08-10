@@ -259,8 +259,6 @@ def store_data_in_zarr(root: zarr.Group, projection_id: str, skycell_name: str, 
         # Check if skycell group exists, create if not
         if skycell_name not in root[projection_id]:
             root[projection_id].create_group(skycell_name)
-            # Store header in skycell group
-            root[projection_id][skycell_name].attrs["header"] = header
 
     # Determine array name based on whether it's a mask or not
     array_name = f"{band}_mask" if is_mask else band
@@ -279,7 +277,10 @@ def store_data_in_zarr(root: zarr.Group, projection_id: str, skycell_name: str, 
             del root[projection_id][skycell_name][array_name]
 
         # Create the array directly
-        root[projection_id][skycell_name].create_array(name=array_name, data=data, chunks=chunks, compressors=[compressor], fill_value=fill_value)
+        array = root[projection_id][skycell_name].create_array(name=array_name, data=data, chunks=chunks, compressors=[compressor], fill_value=fill_value)
+
+        # Store header at the array level, not skycell level
+        array.attrs["header"] = header
 
 
 def is_array_complete(root: zarr.Group, projection_id: str, skycell_name: str, array_name: str, lock_file: Path) -> bool:
