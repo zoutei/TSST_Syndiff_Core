@@ -1,0 +1,21 @@
+# pyproject.toml
+
+[tool.ruff]
+# Set the same line length for Ruff to avoid conflicts with Black.
+line-length = 999
+
+# Select the rule codes to enable.
+# "F" - Pyflakes (error detection)
+# "E", "W" - pycodestyle (style checks)
+# "I" - isort (import sorting)
+# "UP" - pyupgrade (modernize code)
+select = ["F", "E", "W", "I", "UP"]
+
+# You can also ignore specific rules if needed.
+# ignore = ["E501"] # Example: ignore "line too long" if you handle it manually
+
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
