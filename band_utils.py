@@ -29,31 +29,6 @@ def apply_flux_conversion(data: np.ndarray, boffset: float = 1000.0, bsoften: fl
     return flux / exptime
 
 
-def detect_needs_flux_conversion(data: np.ndarray) -> bool:
-    """Detect if data needs flux conversion based on value ranges.
-
-    Args:
-        data: Data array to analyze
-
-    Returns:
-        True if flux conversion appears needed
-    """
-    valid_data = data[~np.isnan(data)]
-    if len(valid_data) == 0:
-        return False
-
-    min_val = np.min(valid_data)
-    max_val = np.max(valid_data)
-    median_val = np.median(valid_data)
-
-    # Log-scale data typically: has negatives, large range, median near zero
-    has_negatives = min_val < -0.1
-    large_range = (max_val - min_val) > 5.0
-    median_near_zero = abs(median_val) < 1.0
-
-    return has_negatives and large_range and median_near_zero
-
-
 def combine_rizy_bands(bands_data: dict[str, np.ndarray], weights: list[float] = None, apply_flux_conv: bool = True) -> np.ndarray:
     """Combine r,i,z,y bands into single image.
 
@@ -89,11 +64,7 @@ def combine_rizy_bands(bands_data: dict[str, np.ndarray], weights: list[float] =
             continue
 
         band_data = bands_data[band].astype(np.float32)
-
-        # Apply flux conversion if needed
-        if apply_flux_conv and detect_needs_flux_conversion(band_data):
-            logger.debug(f"Applying flux conversion to {band} band")
-            band_data = apply_flux_conversion(band_data)
+        band_data = apply_flux_conversion(band_data)
 
         # Add weighted contribution
         combined += band_data * weights[i]
@@ -109,7 +80,7 @@ def combine_masks(masks_data: dict[str, np.ndarray]) -> np.ndarray:
         masks_data: Dictionary mapping band names to mask arrays
 
     Returns:
-        Combined mask array
+        Combined mask array as uint8
     """
     bands = ["r", "i", "z", "y"]
 
@@ -124,12 +95,12 @@ def combine_masks(masks_data: dict[str, np.ndarray]) -> np.ndarray:
         logger.warning("No masks available")
         return None
 
-    combined = np.zeros_like(masks_data[first_mask], dtype=bool)
+    combined = np.zeros_like(masks_data[first_mask], dtype=np.uint16)
 
     # Combine masks with bitwise OR
     for band in bands:
         if band in masks_data:
-            combined |= masks_data[band].astype(bool)
+            combined |= masks_data[band].astype(np.uint16)
 
     logger.debug(f"Combined {len(masks_data)} masks, {combined.sum()} masked pixels")
     return combined
@@ -143,7 +114,7 @@ def process_skycell_bands(bands_data: dict[str, np.ndarray], masks_data: dict[st
         masks_data: Dictionary of mask arrays (optional)
 
     Returns:
-        Tuple of (combined_image, combined_mask)
+        Tuple of (combined_image, combined_mask_uint16)
     """
     # Combine bands
     combined_image = combine_rizy_bands(bands_data)
@@ -155,6 +126,6 @@ def process_skycell_bands(bands_data: dict[str, np.ndarray], masks_data: dict[st
 
     # Create dummy mask if none provided
     if combined_mask is None:
-        combined_mask = np.zeros_like(combined_image, dtype=bool)
+        combined_mask = np.zeros_like(combined_image, dtype=np.uint16)
 
     return combined_image, combined_mask
