@@ -156,7 +156,7 @@ if __name__ == "__main__":
 
     start_time = time.time()
     # Run the pipeline with 2 loader threads and 4 CPU processes
-    final_results = run_processing_pipeline(ZARR_PATH, skycells_to_run, num_producers=5, num_consumers=5)
+    final_results = run_processing_pipeline(ZARR_PATH, skycells_to_run, num_producers=4, num_consumers=10)
     end_time = time.time()
 
     print("\n--- Pipeline Summary ---")
