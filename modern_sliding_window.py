@@ -84,6 +84,7 @@ class ProcessingState:
     current_row_id: Optional[int] = None
     next_row_id: Optional[int] = None
     cell_locations: dict[str, tuple[int, int, int, int]] = None  # name -> (x_start, x_end, y_start, y_end)
+    next_cell_locations: dict[str, tuple[int, int, int, int]] = None  # next row cell locations
     padding_cells: dict[str, PaddingCell] = None  # name -> PaddingCell
 
     def __post_init__(self):
@@ -93,6 +94,8 @@ class ProcessingState:
             self.next_masks = {}
         if self.cell_locations is None:
             self.cell_locations = {}
+        if self.next_cell_locations is None:
+            self.next_cell_locations = {}
         if self.padding_cells is None:
             self.padding_cells = {}
 
@@ -228,43 +231,33 @@ def _parallel_cell_processor(results_queue, target_array, config: MasterArrayCon
             loaded_height, loaded_width = combined_image.shape
 
             # Calculate position using standard cell width for positioning, INCLUDE PAD_SIZE
-            x_start = PAD_SIZE + cell_index * (config.cell_width - CELL_OVERLAP)
-            y_start = PAD_SIZE
+            target_x_start_full = PAD_SIZE + cell_index * (config.cell_width - CELL_OVERLAP)
+            target_x_end = target_x_start_full + config.cell_width
+            target_y_start = PAD_SIZE
+            target_y_end = target_y_start + config.cell_height
 
             # Handle overlap for source region
             if cell_index == 0:
                 # First cell: use full width
                 source_x_start, source_x_end = 0, loaded_width
+                target_x_start = target_x_start_full
             else:
                 # Subsequent cells: skip overlap region if possible
                 source_x_start = EFFECTIVE_OVERLAP
                 source_x_end = loaded_width
+                target_x_start = target_x_start_full + EFFECTIVE_OVERLAP
 
             source_y_start, source_y_end = 0, loaded_height
 
-            # Ensure we don't go out of bounds
-            target_x_end = min(x_start + (source_x_end - source_x_start), target_array.shape[1])
-            target_y_end = min(y_start + (source_y_end - source_y_start), target_array.shape[0])
-
-            # Adjust source to match actual target size
-            target_width = target_x_end - x_start
-            target_height = target_y_end - y_start
-            source_x_end = min(source_x_start + target_width, loaded_width)
-            source_y_end = min(source_y_start + target_height, loaded_height)
-
             # Place the cell and store results
-            if target_x_end > x_start and target_y_end > y_start and source_x_end > source_x_start and source_y_end > source_y_start:
-                target_array[y_start:target_y_end, x_start:target_x_end] = combined_image[source_y_start:source_y_end, source_x_start:source_x_end]
+            target_array[target_y_start:target_y_end, target_x_start:target_x_end] = combined_image[source_y_start:source_y_end, source_x_start:source_x_end]
 
-                logger.debug(f"Placed {cell_name} ({loaded_width}x{loaded_height}) at target[{y_start}:{target_y_end}, {x_start}:{target_x_end}] from source[{source_y_start}:{source_y_end}, {source_x_start}:{source_x_end}]")
+            logger.debug(f"Placed {cell_name} ({loaded_width}x{loaded_height}) at target[{target_y_start}:{target_y_end}, {target_x_start}:{target_x_end}] from source[{source_y_start}:{source_y_end}, {source_x_start}:{source_x_end}]")
 
-                # Extract the mask region that was actually placed
-                extracted_mask = combined_mask[source_y_start:source_y_end, source_x_start:source_x_end]
-                cell_positions[cell_name] = (x_start, target_x_end, y_start, target_y_end)
-                cell_masks[cell_name] = extracted_mask
-                logger.debug(f"Successfully placed cell {cell_name} at position ({x_start}, {target_x_end}, {y_start}, {target_y_end})")
-            else:
-                logger.warning(f"Could not place cell {cell_name} - invalid region")
+            # Extract the mask region that was actually placed
+            cell_positions[cell_name] = (target_x_start_full, target_x_end, target_y_start, target_y_end)
+            cell_masks[cell_name] = combined_mask
+            logger.debug(f"Successfully placed cell {cell_name} at position ({target_x_start}, {target_x_end}, {target_y_start}, {target_y_end})")
 
         except Exception as e:
             logger.warning(f"[Processor] Failed to process cell {cell_name}: {e}")
@@ -282,7 +275,7 @@ def load_row_into_array_parallel(zarr_path: str, projection: str, row_cells: lis
         Tuple of (cell_positions, cell_masks)
     """
     logger.info(f"Loading row with {len(row_cells)} cells in parallel: {row_cells}")
-    target_array.fill(0)  # Clear array
+    target_array.fill(np.nan)  # Clear array
 
     if not row_cells:
         return {}, {}
@@ -516,6 +509,7 @@ def process_row_sliding_window(zarr_path: str, metadata: dict, config: MasterArr
         next_cells = rows.get(next_row_id, [])
         next_positions, next_masks = load_row_into_array_parallel(zarr_path, projection, next_cells, state.next_array, config, metadata, num_loaders=4)
         state.next_masks.update(next_masks)
+        state.next_cell_locations.update(next_positions)  # Store next row cell locations
         state.next_row_id = next_row_id
         logger.info(f"Next row {next_row_id} loaded")
 
@@ -523,12 +517,14 @@ def process_row_sliding_window(zarr_path: str, metadata: dict, config: MasterArr
     logger.info("Applying cross-row padding")
     apply_cross_row_padding(state, config)
 
-    # Load cross-projection padding cells
-    logger.info("Loading cross-projection padding")
-    # Add csv_path to metadata for cross-projection loading
-    metadata_with_csv = dict(metadata)
-    metadata_with_csv["csv_path"] = csv_path
-    load_cross_projection_padding(state, config, metadata_with_csv, current_row_id, zarr_path)
+    # # Load cross-projection padding using modern system
+    # logger.info("Loading cross-projection padding")
+    # # Add csv_path to metadata for cross-projection loading
+    # metadata_with_csv = dict(metadata)
+    # metadata_with_csv["csv_path"] = csv_path
+    # from modern_padding import load_modern_cross_projection_padding
+
+    # load_modern_cross_projection_padding(state, config, metadata_with_csv, current_row_id, zarr_path)
 
     # Convolve current array
     logger.info(f"Starting convolution with sigma={psf_sigma}")
@@ -608,26 +604,29 @@ def create_master_array_wcs(metadata: dict, config: MasterArrayConfig, current_r
     """Create WCS object for the master array based on first cell + padding offset."""
     # Get first cell's WCS information from the dataframe
     proj_df = metadata["dataframe"]
-    proj_df = proj_df[proj_df["projection"] == metadata["projection"]]
-    proj_df = proj_df[proj_df["y"] == current_row_id]
-    proj_df = proj_df.sort_values(by=["x"])
+    # Filter to the current projection and row
+    proj_df = proj_df[proj_df["projection"].astype(str) == str(metadata["projection"])]
+    proj_df = proj_df[proj_df["y"] == int(current_row_id)]
+    proj_df = proj_df.sort_values(by="x")
     first_cell = proj_df.iloc[0]
 
-    # Extract WCS parameters (these field names may need adjustment based on your CSV)
-    crval1 = float(first_cell.get("CRVAL1", 0.0))  # RA reference
-    crval2 = float(first_cell.get("CRVAL2", 0.0))  # Dec reference
-    crpix1 = float(first_cell.get("CRPIX1", 0.0))  # X reference pixel
-    crpix2 = float(first_cell.get("CRPIX2", 0.0))  # Y reference pixel
-    cd1_1 = float(first_cell.get("CD1_1", -1.0 / 3600))  # X pixel scale (degrees/pixel)
-    cd1_2 = float(first_cell.get("CD1_2", 0.0))  # X-Y cross term
-    cd2_1 = float(first_cell.get("CD2_1", 0.0))  # Y-X cross term
-    cd2_2 = float(first_cell.get("CD2_2", 1.0 / 3600))  # Y pixel scale (degrees/pixel)
+    # Extract WCS parameters; use PC and CDELT instead of CD
+    crval1 = float(first_cell["CRVAL1"])
+    crval2 = float(first_cell["CRVAL2"])
+    crpix1 = float(first_cell["CRPIX1"]) + PAD_SIZE
+    crpix2 = float(first_cell["CRPIX2"]) + PAD_SIZE
+    pc1_1 = float(first_cell["PC1_1"])
+    pc1_2 = float(first_cell["PC1_2"])
+    pc2_1 = float(first_cell["PC2_1"])
+    pc2_2 = float(first_cell["PC2_2"])
+    cdelt1 = float(first_cell["CDELT1"])
+    cdelt2 = float(first_cell["CDELT2"])
 
-    # Create WCS object
     master_wcs = WCS(naxis=2)
     master_wcs.wcs.crval = [crval1, crval2]
-    master_wcs.wcs.crpix = [crpix1 + PAD_SIZE, crpix2 + PAD_SIZE]  # Adjust for padding
-    master_wcs.wcs.cd = [[cd1_1, cd1_2], [cd2_1, cd2_2]]
+    master_wcs.wcs.crpix = [crpix1, crpix2]
+    master_wcs.wcs.pc = [[pc1_1, pc1_2], [pc2_1, pc2_2]]
+    master_wcs.wcs.cdelt = [cdelt1, cdelt2]
     master_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     master_wcs.wcs.cunit = ["deg", "deg"]
 
@@ -645,20 +644,23 @@ def create_cell_wcs(cell_name: str, metadata: dict) -> WCS:
     cell_data = cell_row.iloc[0]
 
     # Extract WCS parameters
-    crval1 = float(cell_data.get("CRVAL1", 0.0))
-    crval2 = float(cell_data.get("CRVAL2", 0.0))
-    crpix1 = float(cell_data.get("CRPIX1", 0.0))
-    crpix2 = float(cell_data.get("CRPIX2", 0.0))
-    cd1_1 = float(cell_data.get("CD1_1", -1.0 / 3600))
-    cd1_2 = float(cell_data.get("CD1_2", 0.0))
-    cd2_1 = float(cell_data.get("CD2_1", 0.0))
-    cd2_2 = float(cell_data.get("CD2_2", 1.0 / 3600))
+    crval1 = float(cell_data["CRVAL1"])
+    crval2 = float(cell_data["CRVAL2"])
+    crpix1 = float(cell_data["CRPIX1"]) + PAD_SIZE
+    crpix2 = float(cell_data["CRPIX2"]) + PAD_SIZE
+    pc1_1 = float(cell_data["PC1_1"])
+    pc1_2 = float(cell_data["PC1_2"])
+    pc2_1 = float(cell_data["PC2_1"])
+    pc2_2 = float(cell_data["PC2_2"])
+    cdelt1 = float(cell_data["CDELT1"])
+    cdelt2 = float(cell_data["CDELT2"])
 
     # Create WCS object
     cell_wcs = WCS(naxis=2)
     cell_wcs.wcs.crval = [crval1, crval2]
     cell_wcs.wcs.crpix = [crpix1, crpix2]
-    cell_wcs.wcs.cd = [[cd1_1, cd1_2], [cd2_1, cd2_2]]
+    cell_wcs.wcs.cd = [[pc1_1, pc1_2], [pc2_1, pc2_2]]
+    cell_wcs.wcs.cdelt = [cdelt1, cdelt2]
     cell_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     cell_wcs.wcs.cunit = ["deg", "deg"]
 
@@ -795,8 +797,10 @@ def advance_sliding_window(state: ProcessingState) -> None:
     state.current_row_id = state.next_row_id
     state.next_row_id = None
 
-    # Clear old cell locations but keep padding cell tracking
+    # Transfer next cell locations to current and clear next
     state.cell_locations.clear()
+    state.cell_locations.update(state.next_cell_locations)
+    state.next_cell_locations.clear()
 
     logger.info(f"After advance: current_row_id={state.current_row_id}, next_row_id={state.next_row_id}")
 
