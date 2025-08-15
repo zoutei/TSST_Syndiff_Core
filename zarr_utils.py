@@ -63,7 +63,7 @@ def load_skycell_bands_and_masks(zarr_path: str, projection: str, skycell: str) 
     return bands_data, masks_data
 
 
-def load_skycell_bands(zarr_path: str, projection: str, skycell: str) -> dict[str, np.ndarray]:
+def load_skycell_bands(zarr_store, projection: str, skycell: str) -> dict[str, np.ndarray]:
     """Load all band data for a single skycell.
 
     Args:
@@ -74,13 +74,12 @@ def load_skycell_bands(zarr_path: str, projection: str, skycell: str) -> dict[st
     Returns:
         Dictionary mapping band names to arrays
     """
-    store = zarr.open(zarr_path, mode="r")
     # Handle both short format (e.g., "080") and full format (e.g., "skycell.2556.080")
     if skycell.startswith("skycell."):
         skycell_key = skycell
     else:
         skycell_key = f"skycell.{projection}.{skycell}"
-    skycell_group = store[projection][skycell_key]
+    skycell_group = zarr_store[projection][skycell_key]
 
     bands_data = {}
     for band in ["r", "i", "z", "y"]:
@@ -91,7 +90,7 @@ def load_skycell_bands(zarr_path: str, projection: str, skycell: str) -> dict[st
     return bands_data
 
 
-def load_skycell_masks(zarr_path: str, projection: str, skycell: str) -> dict[str, np.ndarray]:
+def load_skycell_masks(zarr_store, projection: str, skycell: str) -> dict[str, np.ndarray]:
     """Load all mask data for a single skycell.
 
     Args:
@@ -102,13 +101,11 @@ def load_skycell_masks(zarr_path: str, projection: str, skycell: str) -> dict[st
     Returns:
         Dictionary mapping band names to mask arrays
     """
-    store = zarr.open(zarr_path, mode="r")
-    # Handle both short format (e.g., "080") and full format (e.g., "skycell.2556.080")
     if skycell.startswith("skycell."):
         skycell_key = skycell
     else:
         skycell_key = f"skycell.{projection}.{skycell}"
-    skycell_group = store[projection][skycell_key]
+    skycell_group = zarr_store[projection][skycell_key]
 
     masks_data = {}
     for band in ["r", "i", "z", "y"]:
@@ -131,11 +128,11 @@ def load_multiple_skycells(zarr_path: str, skycell_list: list[tuple[str, str]]) 
         Dictionary mapping "projection/skycell" to band data
     """
     results = {}
-
+    zarr_store = zarr.open(zarr_path, mode="r")
     for projection, skycell in skycell_list:
         key = f"{projection}/{skycell}"
         try:
-            bands_data = load_skycell_bands(zarr_path, projection, skycell)
+            bands_data = load_skycell_bands(zarr_store, projection, skycell)
             results[key] = bands_data
         except Exception as e:
             logger.warning(f"Failed to load {key}: {e}")

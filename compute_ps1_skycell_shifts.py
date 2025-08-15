@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
-from typing import tuple
 
 import pandas as pd
 from astropy import units as u

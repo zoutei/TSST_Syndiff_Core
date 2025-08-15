@@ -13,7 +13,6 @@ The script loads PS1 convolved image data from Zarr stores instead of individual
 FITS files, providing better performance and organization.
 """
 
-import json
 import time
 from glob import glob
 from pathlib import Path
@@ -37,23 +36,23 @@ def load_zarr_metadata(sector: int, camera: int, ccd: int, convolved_data_path: 
     Returns:
         Tuple of (metadata_dict, zarr_path)
     """
-    zarr_path = convolved_data_path / f"sector_{sector:04d}" / f"camera_{camera}" / f"ccd_{ccd}" / "convolved_images.zarr"
-    metadata_path = convolved_data_path / f"sector_{sector:04d}" / f"camera_{camera}" / f"ccd_{ccd}" / "cell_metadata.json"
+    zarr_path = convolved_data_path / f"sector_{sector:04d}_camera_{camera}_ccd_{ccd}.zarr"
+    # metadata_path = convolved_data_path / f"sector_{sector:04d}" / f"camera_{camera}" / f"ccd_{ccd}" / "cell_metadata.json"
 
     if not zarr_path.exists():
         raise FileNotFoundError(f"Zarr store not found: {zarr_path}")
 
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    # if not metadata_path.exists():
+    #     raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
-    # Load metadata once
-    with open(metadata_path) as f:
-        metadata = json.load(f)
+    # # Load metadata once
+    # with open(metadata_path) as f:
+    #     metadata = json.load(f)
 
-    return metadata, zarr_path
+    return zarr_path
 
 
-def load_zarr_data_for_skycell(skycell_name: str, metadata: dict, zarr_path: Path) -> tuple[np.ndarray, np.ndarray]:
+def load_zarr_data_for_skycell(skycell_name: str, zarr_store) -> tuple[np.ndarray, np.ndarray]:
     """
     Load PS1 convolved image and mask data from Zarr store for a specific skycell.
 
@@ -66,40 +65,18 @@ def load_zarr_data_for_skycell(skycell_name: str, metadata: dict, zarr_path: Pat
         Tuple of (image_data, mask_data) as numpy arrays
     """
     # Find the index for this skycell from pre-loaded metadata
-    cell_index = None
-    for idx, cell_info in enumerate(metadata["cells"]):
-        if cell_info["name"] == skycell_name:
-            cell_index = idx
-            break
-
-    if cell_index is None:
-        raise ValueError(f"Skycell {skycell_name} not found in metadata")
 
     # Load the Zarr store (this is cached by Zarr internally)
-    zarr_store = zarr.open(str(zarr_path), mode="r")
 
-    # Load the convolved image data for this cell
-    # Assuming the structure has separate arrays for images and masks
-    if "convolved_images" in zarr_store:
-        image_data = zarr_store["convolved_images"][cell_index]
-    elif hasattr(zarr_store, "__len__") and cell_index < len(zarr_store):
-        # If it's a flat array, just use the cell_index
-        image_data = zarr_store[cell_index]
+    if skycell_name.startswith("skycell."):
+        skycell_key = skycell_name
     else:
-        # Try to find arrays by iterating through keys
-        available_keys = list(zarr_store.keys()) if hasattr(zarr_store, "keys") else []
-        raise ValueError(f"Cannot find image data for cell {cell_index}. Available keys: {available_keys}")
+        skycell_key = f"skycell.{skycell_name}"
 
-    # Load mask data (assuming similar structure)
-    if "convolved_masks" in zarr_store:
-        mask_data = zarr_store["convolved_masks"][cell_index]
-    elif "masks" in zarr_store:
-        mask_data = zarr_store["masks"][cell_index]
-    else:
-        # If no separate mask array, create a dummy mask of zeros
-        mask_data = np.zeros_like(image_data, dtype=np.uint32)
+    image_data = zarr_store[f"{skycell_key}_data"]
+    mask_data = zarr_store[f"{skycell_key}_mask"]
 
-    return image_data.astype(np.float32), mask_data.astype(np.uint32)
+    return np.array(image_data).astype(np.float32), np.array(mask_data).astype(np.uint32)
 
 
 def precompute_shifts_for_offsets(tess_wcs: WCS, skycell_df: pd.DataFrame, offsets: np.ndarray) -> dict[tuple[float, float], pd.DataFrame]:
@@ -144,7 +121,7 @@ def precompute_shifts_for_offsets(tess_wcs: WCS, skycell_df: pd.DataFrame, offse
     return shift_results
 
 
-def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: list[str], offsets: np.ndarray, shifts_dict: dict[tuple[float, float], pd.DataFrame], tess_shape: tuple[int, int], zarr_metadata: dict, zarr_path: Path, padding: int = 500, ignore_mask_bits: list[int] = []) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: list[str], offsets: np.ndarray, shifts_dict: dict[tuple[float, float], pd.DataFrame], tess_shape: tuple[int, int], zarr_path: Path, ignore_mask_bits: list[int] = []) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Process a batch of skycells using sparse arrays for memory efficiency
 
@@ -168,19 +145,13 @@ def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: l
     ignore_mask = 0
     for bit in ignore_mask_bits:
         ignore_mask |= 1 << bit
-
+    zarr_store = zarr.open(zarr_path, mode="r")
     # Process each skycell in the batch
     for sc_idx, (reg_file, skycell_name) in enumerate(zip(reg_files, skycell_names)):
         try:
             # Load registration mapping
             with fits.open(reg_file) as hdul:
-                ps1_assignment_x = hdul[1].data.astype(int)
-                ps1_assignment_x[ps1_assignment_x == 65535] = -1
-                ps1_assignment_y = hdul[2].data.astype(int)
-                ps1_assignment_y[ps1_assignment_y == 65535] = 0
-
-            # Create the pixel mapping
-            ps1_assignment = ps1_assignment_x + ps1_assignment_y * t_x
+                ps1_assignment = hdul[1].data.astype(int)
 
             # Prepare for binning
             pind = ps1_assignment.ravel()
@@ -200,16 +171,10 @@ def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: l
             # Try to load PS1 data from Zarr store
             try:
                 # Load PS1 data and mask from Zarr
-                ps1_data, ps1_mask = load_zarr_data_for_skycell(skycell_name, zarr_metadata, zarr_path)
+                ps1_data, ps1_mask = load_zarr_data_for_skycell(skycell_name, zarr_store)
 
-                # Extract the core region without padding (if padding exists in the data)
-                if ps1_data.shape[0] > 2 * padding and ps1_data.shape[1] > 2 * padding:
-                    ps1_base = ps1_data[padding:-padding, padding:-padding]
-                    ps1_mask_base = ps1_mask[padding:-padding, padding:-padding]
-                else:
-                    # If no padding or insufficient padding, use the full data
-                    ps1_base = ps1_data
-                    ps1_mask_base = ps1_mask
+                ps1_base = ps1_data
+                ps1_mask_base = ps1_mask
 
                 # Initialize arrays for each skycell's results
                 pixel_sums = np.zeros((len(tess_pixels), num_offsets), dtype=np.float32)
@@ -307,7 +272,7 @@ def create_syndiff_header(tess_header):
 
     for key in keys_to_copy:
         if key in tess_header:
-            syndiff_header.set(key, tess_header[key], tess_header.comments.get(key, ""))
+            syndiff_header.set(key, tess_header[key], tess_header.comments[key])
 
     # Set PS1 date information
     syndiff_header.set("MJD-OBS", "55197.00000", "TSTART of PS1")
@@ -319,7 +284,7 @@ def create_syndiff_header(tess_header):
 
     for key in tess_header:
         if key.startswith(("A_", "B_", "AP_", "BP_", "RA_", "DEC_", "ROLL_")) or key in keys_to_copy:
-            syndiff_header.set(key, tess_header[key], tess_header.comments.get(key, ""))
+            syndiff_header.set(key, tess_header[key], tess_header.comments[key])
 
     # Add syndiff tag
     syndiff_header.set("SYNDIFF", True, "Syndiff template")
@@ -388,7 +353,7 @@ def main():
     ccd = 3
 
     # Generate paths based on parameters
-    TESS_FITS_PATH = Path(f"/home/kshukawa/syndiff/data/tess/{sector}_{camera}_{ccd}/tess2020019135923-s00{sector}-{camera}-{ccd}-0165-s_ffic.fits")
+    TESS_FITS_PATH = Path(f"/home/kshukawa/syndiff/data/tess_ffi/{sector}_{camera}_{ccd}/tess2020019135923-s00{sector}-{camera}-{ccd}-0165-s_ffic.fits")
     SKYCELL_CSV_PATH = Path(f"/home/kshukawa/syndiff/data/skycell_pixel_mapping/sector_00{sector}/camera_{camera}/ccd_{ccd}/tess_s00{sector}_{camera}_{ccd}_master_skycells_list.csv")
     CONVOLVED_DATA_PATH = Path("/home/kshukawa/syndiff/data/convolved_results/")
     REG_FILES_PATTERN = f"/home/kshukawa/syndiff/data/skycell_pixel_mapping/sector_00{sector}/camera_{camera}/ccd_{ccd}/*.fits.gz"
@@ -397,7 +362,6 @@ def main():
     # Processing parameters - adjusted for better memory efficiency
     N_JOBS = 16  # Reduced number of parallel jobs to lower memory pressure
     SKYCELLS_PER_BATCH = 20  # Adjusted for memory usage
-    padding = 500
 
     """Main function to run the multi-offset downsampling process."""
     # Create output directory
@@ -407,16 +371,16 @@ def main():
     offsets = np.array(
         [
             [0.1, 0.1],  # dx, dy
-            [0.2, 0.0],
-            [0.0, 0.2],
-            [-0.1, 0.1],
-            [-0.1, -0.1],
+            # [0.2, 0.0],
+            # [0.0, 0.2],
+            # [-0.1, 0.1],
+            # [-0.1, -0.1],
         ]
     )
 
     # Set mask bits to ignore (0-indexed)
     # For example, to ignore bits 0, 2, and 5:
-    ignore_mask_bits = [5]
+    ignore_mask_bits = [12]
 
     # Load TESS data and WCS
     print("Loading TESS data and WCS...")
@@ -435,8 +399,8 @@ def main():
 
     # Load Zarr metadata once for efficient access
     print("Loading Zarr metadata...")
-    zarr_metadata, zarr_path = load_zarr_metadata(sector, camera, ccd, CONVOLVED_DATA_PATH)
-    print(f"Found {len(zarr_metadata['cells'])} cells in Zarr store")
+    zarr_path = load_zarr_metadata(sector, camera, ccd, CONVOLVED_DATA_PATH)
+    # print(f"Found {len(zarr_metadata['cells'])} cells in Zarr store")
 
     # Precompute shifts for all offsets
     print("Precomputing shifts for all offsets...")
@@ -444,8 +408,8 @@ def main():
 
     # Get registration files
     print("Getting registration files...")
-    reg_files = sorted(glob(REG_FILES_PATTERN))
-    skycell_names = [Path(f).stem.split("_")[0] for f in reg_files]  # Extract skycell names
+    reg_files = sorted(glob(REG_FILES_PATTERN))[1:]
+    skycell_names = [f"skycell.{'.'.join(Path(f).stem.split('.')[1:3])}" for f in reg_files]  # Extract skycell names
 
     # Split into batches
     num_batches = (len(reg_files) + SKYCELLS_PER_BATCH - 1) // SKYCELLS_PER_BATCH
@@ -455,7 +419,7 @@ def main():
     name_batches = np.array_split(skycell_names, num_batches)
 
     # Process batches in parallel
-    results = Parallel(n_jobs=N_JOBS)(delayed(process_skycell_batch)(i, reg_batch, name_batch, offsets, shifts_dict, tess_data.shape, zarr_metadata, zarr_path, padding=padding, ignore_mask_bits=ignore_mask_bits) for i, (reg_batch, name_batch) in enumerate(zip(reg_batches, name_batches)))
+    results = Parallel(n_jobs=N_JOBS)(delayed(process_skycell_batch)(i, reg_batch, name_batch, offsets, shifts_dict, tess_data.shape, zarr_path, ignore_mask_bits=ignore_mask_bits) for i, (reg_batch, name_batch) in enumerate(zip(reg_batches, name_batches)))
 
     # Combine results using the sparse array approach
     print("Combining results...")

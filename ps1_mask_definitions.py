@@ -6,7 +6,7 @@ These are the actual bit definitions from PS1 FITS headers:
 
 Bit 0 (1):     DETECTOR - Detector issue
 Bit 1 (2):     FLAT - Flat field issue
-Bit 2 (4):     DARK - Dark current issue  
+Bit 2 (4):     DARK - Dark current issue
 Bit 3 (8):     BLANK - Blank/missing data
 Bit 4 (16):    CTE - Charge transfer efficiency issue
 Bit 5 (32):    SAT - Saturated pixel
@@ -29,46 +29,48 @@ Each pixel's mask value is the sum of all applicable flags.
 
 # PS1 mask bit definitions (REAL PS1 VALUES)
 PS1_MASK_BITS = {
-    'DETECTOR': 1,        # Bit 0
-    'FLAT': 2,            # Bit 1  
-    'DARK': 4,            # Bit 2
-    'BLANK': 8,           # Bit 3
-    'CTE': 16,            # Bit 4
-    'SAT': 32,            # Bit 5
-    'LOW': 64,            # Bit 6
-    'SUSPECT': 128,       # Bit 7
-    'BURNTOOL': 128,      # Bit 8 (same as SUSPECT - possible header error?)
-    'CR': 256,            # Bit 9
-    'SPIKE': 512,         # Bit 10
-    'GHOST': 1024,        # Bit 11
-    'STREAK': 2048,       # Bit 12
-    'STARCORE': 4096,     # Bit 13
-    'CONV.BAD': 8192,     # Bit 14
-    'CONV.POOR': 16384,   # Bit 15
+    "DETECTOR": 1,  # Bit 0
+    "FLAT": 2,  # Bit 1
+    "DARK": 4,  # Bit 2
+    "BLANK": 8,  # Bit 3
+    "CTE": 16,  # Bit 4
+    "SAT": 32,  # Bit 5
+    "LOW": 64,  # Bit 6
+    "SUSPECT": 128,  # Bit 7
+    "BURNTOOL": 128,  # Bit 7
+    "CR": 256,  # Bit 8
+    "SPIKE": 512,  # Bit 9
+    "GHOST": 1024,  # Bit 10
+    "STREAK": 2048,  # Bit 11
+    "STARCORE": 4096,  # Bit 12
+    "CONV.BAD": 8192,  # Bit 13
+    "CONV.POOR": 16384,  # Bit 14
 }
 
 # Special PS1 mask values
 PS1_SPECIAL_VALUES = {
-    'MASK.VALUE': 8575,   # Combined mask value
-    'MARK.VALUE': 32768,  # Mark value
+    "MASK.VALUE": 8575,  # Combined mask value
+    "MARK.VALUE": 32768,  # Mark value
 }
+
 
 def decode_ps1_mask(mask_value):
     """Decode PS1 mask value into individual flags."""
     flags = []
-    
+
     # Check for special values first
-    if mask_value == PS1_SPECIAL_VALUES['MASK.VALUE']:
-        flags.append('MASK.VALUE')
-    elif mask_value == PS1_SPECIAL_VALUES['MARK.VALUE']:
-        flags.append('MARK.VALUE')
+    if mask_value == PS1_SPECIAL_VALUES["MASK.VALUE"]:
+        flags.append("MASK.VALUE")
+    elif mask_value == PS1_SPECIAL_VALUES["MARK.VALUE"]:
+        flags.append("MARK.VALUE")
     else:
         # Check individual bit flags
         for flag_name, bit_value in PS1_MASK_BITS.items():
             if mask_value & bit_value:
                 flags.append(flag_name)
-    
+
     return flags
+
 
 def encode_ps1_mask(flags):
     """Encode list of flags into PS1 mask value."""
