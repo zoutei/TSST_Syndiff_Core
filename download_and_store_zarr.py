@@ -283,11 +283,15 @@ def store_data_in_zarr(root: zarr.Group, projection_id: str, skycell_name: str, 
         array.attrs["header"] = header
 
 
-def is_array_complete(root: zarr.Group, projection_id: str, skycell_name: str, array_name: str, lock_file: Path) -> bool:
+def is_array_complete(root: zarr.Group, projection_id: str, skycell_name: str, array_name: str, lock_file: Path, overwrite: bool = False) -> bool:
     """
     Check if an array is complete and not corrupted.
     This helps detect arrays that were interrupted during writing.
     """
+    # If overwrite requested, treat arrays as incomplete so they will be re-downloaded
+    if overwrite:
+        return False
+
     try:
         with FileLock(lock_file):
             if projection_id not in root or skycell_name not in root[projection_id] or array_name not in root[projection_id][skycell_name]:
@@ -313,14 +317,14 @@ def is_array_complete(root: zarr.Group, projection_id: str, skycell_name: str, a
         return False
 
 
-def process_skycell_band(root: zarr.Group, skycell_name: str, skycell_name_parts: list, band: str, is_mask: bool, projection_id: str, lock_file: Path, use_local_files: bool = False, local_data_path: Optional[Path] = None) -> bool:
+def process_skycell_band(root: zarr.Group, skycell_name: str, skycell_name_parts: list, band: str, is_mask: bool, projection_id: str, lock_file: Path, use_local_files: bool = False, local_data_path: Optional[Path] = None, overwrite: bool = False) -> bool:
     """
     Process a single band/mask for a skycell and store it in the zarr store.
     """
     array_name = f"{band}_mask" if is_mask else band
 
     # Check if this array already exists and is complete
-    if is_array_complete(root, projection_id, skycell_name, array_name, lock_file):
+    if is_array_complete(root, projection_id, skycell_name, array_name, lock_file, overwrite=overwrite):
         logging.debug(f"Skipping existing complete {array_name} for {skycell_name}")
         return True
 
@@ -334,7 +338,7 @@ def process_skycell_band(root: zarr.Group, skycell_name: str, skycell_name_parts
     return False
 
 
-def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: Path, use_local_files: bool = False, local_data_path: Optional[Path] = None) -> None:
+def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: Path, use_local_files: bool = False, local_data_path: Optional[Path] = None, overwrite: bool = False) -> None:
     """
     Manages the download and storage of a single skycell into the
     single Zarr store. Uses filelock for thread-safe operations.
@@ -350,10 +354,10 @@ def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: P
     for band in bands:
         expected_arrays.extend([band, f"{band}_mask"])
 
-    # Check if all arrays are complete
+    # Check if all arrays are complete (unless overwrite requested)
     all_complete = True
     for array_name in expected_arrays:
-        if not is_array_complete(root, projection_id, skycell_name, array_name, lock_file):
+        if not is_array_complete(root, projection_id, skycell_name, array_name, lock_file, overwrite=overwrite):
             all_complete = False
             break
 
@@ -370,7 +374,6 @@ def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: P
         if shutdown_requested:
             logging.info("Shutdown requested, stopping skycell processing")
             return
-
         # Process in parallel using thread pool to speed up download
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             # Register executor for shutdown handling
@@ -378,8 +381,8 @@ def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: P
 
             try:
                 # Submit tasks for image and mask
-                img_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, False, projection_id, lock_file, use_local_files, local_data_path)
-                mask_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, True, projection_id, lock_file, use_local_files, local_data_path)
+                img_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, False, projection_id, lock_file, use_local_files, local_data_path, overwrite)
+                mask_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, True, projection_id, lock_file, use_local_files, local_data_path, overwrite)
 
                 # Wait for both tasks to complete
                 img_success = img_future.result()
@@ -396,7 +399,7 @@ def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: P
                     active_executors.remove(executor)
 
 
-def process_skycells_with_dask(root: zarr.Group, skycells: list, lock_file: Path, batch_size: int = 10, num_workers: int = 8, use_local_files: bool = False, local_data_path: Optional[Path] = None):
+def process_skycells_with_dask(root: zarr.Group, skycells: list, lock_file: Path, batch_size: int = 10, num_workers: int = 8, use_local_files: bool = False, local_data_path: Optional[Path] = None, overwrite: bool = False):
     """
     Process skycells using Dask for distributed processing.
     This provides better scalability than joblib.
@@ -412,7 +415,7 @@ def process_skycells_with_dask(root: zarr.Group, skycells: list, lock_file: Path
                 if shutdown_requested:
                     logging.info("Shutdown requested, stopping batch processing")
                     return 0
-                download_and_store_skycell(root, skycell_name, lock_file, use_local_files, local_data_path)
+                download_and_store_skycell(root, skycell_name, lock_file, use_local_files, local_data_path, overwrite)
             return len(batch)
 
         # Group skycells into batches
@@ -437,7 +440,7 @@ def process_skycells_with_dask(root: zarr.Group, skycells: list, lock_file: Path
             active_dask_computations.remove(computation)
 
 
-def download_and_store_ps1_data(sector=20, camera=3, ccd=3, num_workers=8, zarr_output_dir="data/ps1_skycells_zarr", use_local_files=False, local_data_path="data/ps1_skycells", log_level="ERROR"):
+def download_and_store_ps1_data(sector=20, camera=3, ccd=3, num_workers=8, zarr_output_dir="data/ps1_skycells_zarr", use_local_files=False, local_data_path="data/ps1_skycells", log_level="ERROR", overwrite: bool = False):
     """
     Download PS1 skycell data and store it in a single Zarr array.
 
@@ -523,7 +526,7 @@ def download_and_store_ps1_data(sector=20, camera=3, ccd=3, num_workers=8, zarr_
         return {"status": "interrupted", "message": "Processing interrupted by shutdown request", "skycells_found": len(skycells_df), "unique_images": len(unique_ps1_images)}
 
     # Process skycells using Dask
-    process_skycells_with_dask(root, list(unique_ps1_images), lock_file, num_workers=num_workers, use_local_files=use_local_files, local_data_path=local_data_path)
+    process_skycells_with_dask(root, list(unique_ps1_images), lock_file, num_workers=num_workers, use_local_files=use_local_files, local_data_path=local_data_path, overwrite=overwrite)
 
     logging.info("Download and Zarr storage process completed.")
 
@@ -534,15 +537,16 @@ def main():
     """Main function to run the parallel download and store process."""
     parser = argparse.ArgumentParser(description="Download PS1 skycell data and store in single Zarr array")
 
-    parser.add_argument("--sector", type=int, default=20, help="TESS sector number")
-    parser.add_argument("--camera", type=int, default=3, help="TESS camera number")
-    parser.add_argument("--ccd", type=int, default=3, help="TESS CCD number")
+    parser.add_argument("sector", type=int, help="TESS sector number")
+    parser.add_argument("camera", type=int, help="TESS camera number")
+    parser.add_argument("ccd", type=int, help="TESS CCD number")
     parser.add_argument("--num-workers", type=int, default=32, help="Number of parallel workers for Dask")
     parser.add_argument("--zarr-output-dir", type=str, default="data/ps1_skycells_zarr", help="Directory for Zarr output")
 
     parser.add_argument("--use-local-files", action="store_true", help="Use locally saved FITS files instead of downloading when available")
     parser.add_argument("--local-data-path", type=str, default="data/ps1_skycells", help="Path to local PS1 skycell data directory")
     parser.add_argument("--log-level", type=str, default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set the logging level (default: WARNING)")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing arrays in the Zarr store (default: skip existing)")
 
     args = parser.parse_args()
 
@@ -551,7 +555,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Call the main processing function
-    result = download_and_store_ps1_data(sector=args.sector, camera=args.camera, ccd=args.ccd, num_workers=args.num_workers, zarr_output_dir=args.zarr_output_dir, use_local_files=args.use_local_files, local_data_path=args.local_data_path, log_level=args.log_level)
+    result = download_and_store_ps1_data(sector=args.sector, camera=args.camera, ccd=args.ccd, num_workers=args.num_workers, zarr_output_dir=args.zarr_output_dir, use_local_files=args.use_local_files, local_data_path=args.local_data_path, log_level=args.log_level, overwrite=args.overwrite)
 
     # Print result summary
     print(f"\nProcessing completed with status: {result['status']}")
