@@ -14,13 +14,12 @@ from typing import Optional
 
 import numpy as np
 from astropy.wcs import WCS
-from reproject import reproject_interp
 
 # Import existing utilities
 from band_utils import process_skycell_bands
 from convolution_utils import apply_gaussian_convolution
 from csv_utils import load_csv_data
-from zarr_utils import load_skycell_bands_and_masks
+from zarr_utils import load_skycell_bands_masks_and_headers
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +181,9 @@ def _parallel_cell_loader(tasks_queue, results_queue, zarr_path):
 
         try:
             logger.debug(f"[Loader] Loading cell {cell_name} (index {cell_index})")
-            # Load and combine bands using parallel loading
-            bands_data, masks_data = load_skycell_bands_and_masks(zarr_path, projection, cell_name)
-            combined_image, combined_mask = process_skycell_bands(bands_data, masks_data)
+            # Load and combine bands using parallel loading with headers
+            bands_data, masks_data, headers_data = load_skycell_bands_masks_and_headers(zarr_path, projection, cell_name)
+            combined_image, combined_mask = process_skycell_bands(bands_data, masks_data, headers_data)
 
             # Put the loaded data onto the results queue
             results_queue.put(("success", cell_name, cell_index, combined_image, combined_mask))
@@ -343,9 +342,9 @@ def load_and_place_cell(zarr_path: str, cell_name: str, projection: str, cell_in
     try:
         # logger.info(f"Loading cell {cell_name} (index {cell_index}) from projection {projection}")
 
-        # Load and combine bands using parallel loading
-        bands_data, masks_data = load_skycell_bands_and_masks(zarr_path, projection, cell_name)
-        combined_image, combined_mask = process_skycell_bands(bands_data, masks_data)
+        # Load and combine bands using parallel loading with headers
+        bands_data, masks_data, headers_data = load_skycell_bands_masks_and_headers(zarr_path, projection, cell_name)
+        combined_image, combined_mask = process_skycell_bands(bands_data, masks_data, headers_data)
 
         # Get actual cell dimensions from config
         actual_width, actual_height = config.cell_dimensions.get(cell_name, (config.cell_width, config.cell_height))
@@ -528,6 +527,8 @@ def process_row_sliding_window(zarr_path: str, metadata: dict, config: MasterArr
 
     # Convolve current array
     logger.info(f"Starting convolution with sigma={psf_sigma}")
+    nans_loc = np.isnan(state.current_array)
+    state.current_array[nans_loc] = 0  # Replace NaNs with 0 for convolution
     convolved = apply_gaussian_convolution(state.current_array, sigma=psf_sigma)
     logger.info("Convolution completed")
 
@@ -543,61 +544,6 @@ def process_row_sliding_window(zarr_path: str, metadata: dict, config: MasterArr
     logger.info(f"Row {current_row_id} processing complete: {len(results_data)} results extracted")
 
     return results_data, current_masks_for_row
-
-
-def identify_padding_requirements(metadata: dict, csv_path: str) -> dict[str, PaddingCell]:
-    """Identify all cells needed for padding, excluding those in the same projection."""
-    df = load_csv_data(csv_path)
-    current_projection = metadata["projection"]
-    padding_cells = {}
-
-    # Get all rows for current projection
-    proj_df = df[df["projection"].astype(str) == current_projection]
-
-    padding_columns = ["pad_skycell_top", "pad_skycell_right", "pad_skycell_top_right", "pad_skycell_bottom", "pad_skycell_left", "pad_skycell_bottom_left", "pad_skycell_bottom_right", "pad_skycell_top_left"]
-
-    for _, row in proj_df.iterrows():
-        current_row_id = int(row["y"])
-
-        for column in padding_columns:
-            padding_value = row.get(column, "")
-            if padding_value and str(padding_value) != "nan" and str(padding_value).strip():
-                # Handle slash-separated cells like "skycell.2586.003/skycell.2557.098"
-                cell_names = str(padding_value).split("/")
-
-                for cell_name in cell_names:
-                    cell_name = cell_name.strip()
-                    if not cell_name:
-                        continue
-
-                    # Extract projection from cell name (e.g., "skycell.2556.080" -> "2556")
-                    try:
-                        cell_projection = cell_name.split(".")[1]
-                    except IndexError:
-                        logger.warning(f"Could not extract projection from cell name: {cell_name}")
-                        continue
-
-                    # Only include cells from different projections
-                    if cell_projection != current_projection:
-                        # Determine location from column name
-                        location = column.replace("pad_skycell_", "")
-
-                        if cell_name not in padding_cells:
-                            padding_cells[cell_name] = PaddingCell(name=cell_name, projection=cell_projection, loaded=False)
-
-                        # Add this row and location to the padding cell's usage
-                        if current_row_id not in padding_cells[cell_name].used_for:
-                            padding_cells[cell_name].used_for.append(current_row_id)
-                        if location not in padding_cells[cell_name].locations:
-                            padding_cells[cell_name].locations.append(location)
-
-    logger.info(f"Identified {len(padding_cells)} cross-projection padding cells for projection {current_projection}")
-
-    # Debug log
-    for cell_name, padding_cell in padding_cells.items():
-        logger.debug(f"Padding cell {cell_name} from projection {padding_cell.projection}, used for rows {padding_cell.used_for} at locations {padding_cell.locations}")
-
-    return padding_cells
 
 
 def create_master_array_wcs(metadata: dict, config: MasterArrayConfig, current_row_id: int) -> WCS:
@@ -667,122 +613,6 @@ def create_cell_wcs(cell_name: str, metadata: dict) -> WCS:
     return cell_wcs
 
 
-def reproject_cell_to_master(cell_data: np.ndarray, cell_mask: np.ndarray, source_cell_name: str, source_metadata: dict, target_wcs: WCS, target_shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    """Reproject a cell from its native projection to the master array coordinate system."""
-    try:
-        # Create source WCS
-        source_wcs = create_cell_wcs(source_cell_name, source_metadata)
-
-        # Reproject data
-        reprojected_data, footprint = reproject_interp((cell_data, source_wcs), target_wcs, target_shape, order="linear")
-
-        # Reproject mask (treat as data for reprojection, then threshold)
-        reprojected_mask_float, _ = reproject_interp((cell_mask.astype(np.float32), source_wcs), target_wcs, target_shape, order="nearest")
-
-        # Convert mask back to uint8, threshold at 0.5
-        reprojected_mask = (reprojected_mask_float > 0.5).astype(np.uint8)
-
-        # Handle NaN values in reprojected data
-        if np.any(np.isnan(reprojected_data)):
-            nan_mask = np.isnan(reprojected_data)
-            reprojected_data[nan_mask] = 0.0
-            reprojected_mask[nan_mask] = 1  # Mark NaN regions as masked
-
-        logger.info(f"Successfully reprojected cell {source_cell_name} to target shape {target_shape}")
-        return reprojected_data, reprojected_mask
-
-    except Exception as e:
-        logger.error(f"Reprojection failed for cell {source_cell_name}: {e}")
-        # Fallback: simple resize/crop
-        height, width = target_shape
-        if cell_data.shape[0] >= height and cell_data.shape[1] >= width:
-            reprojected_data = cell_data[:height, :width]
-            reprojected_mask = cell_mask[:height, :width]
-        else:
-            # Pad if too small
-            reprojected_data = np.zeros((height, width), dtype=cell_data.dtype)
-            reprojected_mask = np.zeros((height, width), dtype=np.uint8)
-            h_copy = min(height, cell_data.shape[0])
-            w_copy = min(width, cell_data.shape[1])
-            reprojected_data[:h_copy, :w_copy] = cell_data[:h_copy, :w_copy]
-            reprojected_mask[:h_copy, :w_copy] = cell_mask[:h_copy, :w_copy]
-
-        return reprojected_data, reprojected_mask
-
-
-def load_cross_projection_padding(state: ProcessingState, config: MasterArrayConfig, metadata: dict, current_row_id: int, zarr_path: str) -> None:
-    """Load padding cells from other projections using reprojection."""
-    master_wcs = create_master_array_wcs(metadata, config, current_row_id)
-
-    # Check what padding is still needed
-    remaining_padding = []
-    for cell_name, padding_cell in state.padding_cells.items():
-        if not padding_cell.loaded and padding_cell.projection != metadata["projection"]:
-            remaining_padding.append((cell_name, padding_cell))
-
-    if not remaining_padding:
-        logger.info("No cross-projection padding needed")
-        return
-
-    logger.info(f"Loading {len(remaining_padding)} cross-projection padding cells")
-
-    for cell_name, padding_cell in remaining_padding:
-        try:
-            # Load cell from its native projection using parallel loading
-            bands_data, masks_data = load_skycell_bands_and_masks(zarr_path, padding_cell.projection, cell_name)
-            cell_data, cell_mask = process_skycell_bands(bands_data, masks_data)
-
-            # Create source metadata for the padding cell's projection
-            # Use the main CSV file instead of a separate metadata CSV
-            try:
-                csv_path = metadata.get("csv_path", zarr_path.replace(".zarr", "_metadata.csv"))
-                source_metadata = extract_projection_metadata(csv_path, padding_cell.projection)
-            except Exception as csv_error:
-                logger.warning(f"Could not load metadata for projection {padding_cell.projection}: {csv_error}")
-                # Skip this padding cell if we can't get its metadata
-                continue
-
-            # For each location this cell is used for padding
-            for location in padding_cell.locations:
-                # Determine target region and shape based on location
-                if location == "top":
-                    target_shape = (PAD_SIZE, config.width)
-                    target_y_start, target_y_end = 0, PAD_SIZE
-                elif location == "bottom":
-                    target_shape = (config.height - (PAD_SIZE + config.cell_height), config.width)
-                    target_y_start = PAD_SIZE + config.cell_height
-                    target_y_end = config.height
-                elif location == "left":
-                    target_shape = (config.height, PAD_SIZE)
-                    target_y_start, target_y_end = 0, config.height
-                elif location == "right":
-                    target_shape = (config.height, config.width - (PAD_SIZE + config.max_cells * config.cell_width))
-                    target_y_start, target_y_end = 0, config.height
-                else:
-                    continue
-
-                # Reproject to master coordinate system
-                reprojected_data, reprojected_mask = reproject_cell_to_master(cell_data, cell_mask, cell_name, source_metadata, master_wcs, target_shape)
-
-                # Place reprojected data in appropriate arrays
-                if location in ["top", "bottom"]:
-                    x_start, x_end = 0, config.width
-                else:  # left, right
-                    x_start = 0 if location == "left" else PAD_SIZE + config.max_cells * config.cell_width
-                    x_end = x_start + target_shape[1]
-
-                if "current" in padding_cell.used_for:
-                    state.current_array[target_y_start:target_y_end, x_start:x_end] = reprojected_data
-                if "next" in padding_cell.used_for:
-                    state.next_array[target_y_start:target_y_end, x_start:x_end] = reprojected_data
-
-            padding_cell.loaded = True
-            logger.info(f"Loaded cross-projection padding cell {cell_name} from {padding_cell.projection}")
-
-        except Exception as e:
-            logger.warning(f"Failed to load cross-projection padding cell {cell_name}: {e}")
-
-
 def advance_sliding_window(state: ProcessingState) -> None:
     """Advance the sliding window (next becomes current)."""
     logger.info(f"Before advance: current_row_id={state.current_row_id}, next_row_id={state.next_row_id}")
@@ -819,7 +649,7 @@ def process_projection_sliding_window(zarr_path: str, csv_path: str, projection:
 
     # Identify padding requirements
     logger.info("Identifying padding requirements")
-    state.padding_cells = identify_padding_requirements(metadata, csv_path)
+    # state.padding_cells = identify_padding_requirements(metadata, csv_path)
 
     logger.info(f"Projection {projection}: {len(metadata['rows'])} rows, max {config.max_cells} cells/row, cell size {config.cell_width}x{config.cell_height}")
 
@@ -876,7 +706,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
 
     # Set up paths
     zarr_path = f"{data_root}/ps1_skycells_zarr/ps1_skycells.zarr"
-    output_path = f"{data_root}/convolved_results_sliding/sector_{sector:04d}_camera_{camera}_ccd_{ccd}.zarr"
+    output_path = f"{data_root}/convolved_results/sector_{sector:04d}_camera_{camera}_ccd_{ccd}.zarr"
 
     try:
         from csv_utils import find_csv_file, get_projections_from_csv

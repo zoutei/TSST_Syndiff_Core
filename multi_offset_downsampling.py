@@ -292,7 +292,7 @@ def create_syndiff_header(tess_header):
     return syndiff_header
 
 
-def save_fits_outputs(output_dir: Path, results: np.ndarray, offsets: np.ndarray, tess_header: fits.Header, save_extensions: bool = True):
+def save_fits_outputs(output_dir: Path, sector: int, camera: int, ccd: int, results: np.ndarray, offsets: np.ndarray, tess_header: fits.Header):
     """
     Save the results as FITS files.
 
@@ -318,75 +318,56 @@ def save_fits_outputs(output_dir: Path, results: np.ndarray, offsets: np.ndarray
 
     # Save each offset result as a FITS file
     for idx, (dx, dy) in enumerate(offsets):
-        # Calculate final image (handle division by zero)
-        mask = results[idx, 1] > 0  # Pixels with counts
-        final_image = np.zeros_like(results[idx, 0])
-        final_image[mask] = results[idx, 0][mask] / results[idx, 1][mask]
-
         # Update header with offset information
         offset_header = syndiff_header.copy()
         offset_header["DX_SHIFT"] = (dx, "TESS pixel x shift")
         offset_header["DY_SHIFT"] = (dy, "TESS pixel y shift")
 
-        # File with just the data
-        primary_hdu = fits.PrimaryHDU(data=final_image, header=offset_header)
-        hdu_list = fits.HDUList([primary_hdu])
-        output_filename = output_dir / f"_dx{dx:.3f}_dy{dy:.3f}.fits"
+        # File with data, count, and mask as extensions
+        primary_hdu = fits.PrimaryHDU(header=offset_header)
+        # FLUX extension = SUM per TESS pixel
+        hdu1 = fits.ImageHDU(data=results[idx, 0].astype(np.float32), header=offset_header, name="FLUX_SUM")
+        # Optionally add average if desired:
+        # hdu_avg = fits.ImageHDU(data=avg_image, header=offset_header, name="FLUX_AVG")
+        hdu2 = fits.ImageHDU(data=results[idx, 1].astype(np.int32), header=offset_header, name="COUNT")
+        hdu3 = fits.ImageHDU(data=results[idx, 2].astype(np.int32), header=offset_header, name="MASK")
+
+        hdu_list = fits.HDUList([primary_hdu, hdu1, hdu2, hdu3])
+        output_filename = output_dir / f"syndiff_template_s{sector:04d}_{camera}_{ccd}_dx{dx:.3f}_dy{dy:.3f}.fits"
         hdu_list.writeto(output_filename, overwrite=True)
 
-        if save_extensions:
-            # File with data, count, and mask as extensions
-            primary_hdu = fits.PrimaryHDU(header=offset_header)
-            hdu1 = fits.ImageHDU(data=final_image, header=offset_header, name="FLUX")
-            hdu2 = fits.ImageHDU(data=results[idx, 1].astype(np.int32), header=offset_header, name="COUNT")
-            hdu3 = fits.ImageHDU(data=results[idx, 2].astype(np.int32), header=offset_header, name="MASK")
 
-            hdu_list = fits.HDUList([primary_hdu, hdu1, hdu2, hdu3])
-            output_filename = output_dir / f"downsampled_dx{dx:.3f}_dy{dy:.3f}_extended.fits"
-            hdu_list.writeto(output_filename, overwrite=True)
-
-
-def main():
-    # Set sector, camera, and ccd
-    sector = 20
-    camera = 3
-    ccd = 3
+def main(sector: int = 20, camera: int = 3, ccd: int = 3, offsets: np.ndarray = np.array([[0.0, 0.0]]), ignore_mask_bits: list[int] = [12], data_root: str | Path = "data", convolved_dir: str | Path | None = None, output_base: str | Path | None = None):
+    # Resolve base paths (allow overrides)
+    data_root = Path(data_root)
+    if convolved_dir is None:
+        convolved_dir = data_root / "convolved_results"
+    else:
+        convolved_dir = Path(convolved_dir)
+    if output_base is None:
+        output_base = data_root / "shifted_downsampled"
+    else:
+        output_base = Path(output_base)
 
     # Generate paths based on parameters
-    TESS_FITS_PATH = Path(f"/home/kshukawa/syndiff/data/tess_ffi/{sector}_{camera}_{ccd}/tess2020019135923-s00{sector}-{camera}-{ccd}-0165-s_ffic.fits")
-    SKYCELL_CSV_PATH = Path(f"/home/kshukawa/syndiff/data/skycell_pixel_mapping/sector_00{sector}/camera_{camera}/ccd_{ccd}/tess_s00{sector}_{camera}_{ccd}_master_skycells_list.csv")
-    CONVOLVED_DATA_PATH = Path("/home/kshukawa/syndiff/data/convolved_results/")
-    REG_FILES_PATTERN = f"/home/kshukawa/syndiff/data/skycell_pixel_mapping/sector_00{sector}/camera_{camera}/ccd_{ccd}/*.fits.gz"
-    OUTPUT_DIR = Path(f"/home/kshukawa/syndiff/data/shifted_downsamples/sector{sector}_camera{camera}_ccd{ccd}")
+    SKYCELL_CSV_PATH = data_root / f"skycell_pixel_mapping/sector_{sector:04d}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_skycells_list.csv"
+    CONVOLVED_DATA_PATH = Path(convolved_dir)
+    REG_FILES_PATTERN = str(data_root / f"skycell_pixel_mapping/sector_{sector:04d}/camera_{camera}/ccd_{ccd}/*.fits.gz")
+    REG_MASTER_FILES_PATH = str(data_root / f"skycell_pixel_mapping/sector_{sector:04d}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_pixels2skycells.fits.gz")
+    OUTPUT_DIR = output_base / f"sector{sector:04d}_camera{camera}_ccd{ccd}"
 
     # Processing parameters - adjusted for better memory efficiency
     N_JOBS = 16  # Reduced number of parallel jobs to lower memory pressure
     SKYCELLS_PER_BATCH = 20  # Adjusted for memory usage
 
-    """Main function to run the multi-offset downsampling process."""
     # Create output directory
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Define offsets to process (could be loaded from a file)
-    offsets = np.array(
-        [
-            [0.1, 0.1],  # dx, dy
-            # [0.2, 0.0],
-            # [0.0, 0.2],
-            # [-0.1, 0.1],
-            # [-0.1, -0.1],
-        ]
-    )
-
-    # Set mask bits to ignore (0-indexed)
-    # For example, to ignore bits 0, 2, and 5:
-    ignore_mask_bits = [12]
 
     # Load TESS data and WCS
     print("Loading TESS data and WCS...")
     start_time = time.time()
-    tess_wcs, tess_dims = load_tess_wcs(TESS_FITS_PATH)
-    with fits.open(TESS_FITS_PATH) as hdul:
+    tess_wcs, tess_dims = load_tess_wcs(REG_MASTER_FILES_PATH)
+    with fits.open(REG_MASTER_FILES_PATH) as hdul:
         # Find HDU with data
         hdu_idx = 1 if len(hdul) > 1 and getattr(hdul[1], "data", None) is not None else 0
         tess_data = hdul[hdu_idx].data.astype(np.float32)
@@ -481,7 +462,7 @@ def main():
 
     # Save outputs as FITS files
     print("Saving outputs...")
-    save_fits_outputs(OUTPUT_DIR, combined_results, offsets, tess_header, save_extensions=True)
+    save_fits_outputs(output_dir=OUTPUT_DIR, sector=sector, camera=camera, ccd=ccd, results=combined_results, offsets=offsets, tess_header=tess_header)
 
     # Record processing time
     total_time = time.time() - start_time
@@ -500,4 +481,29 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Multi-offset downsampling runner")
+    parser.add_argument("sector", nargs="?", type=int, default=20, help="TESS sector number (default: 20)")
+    parser.add_argument("camera", nargs="?", type=int, default=3, help="Camera number (default: 3)")
+    parser.add_argument("ccd", nargs="?", type=int, default=3, help="CCD number (default: 3)")
+    parser.add_argument("--data-root", type=str, default=str(Path(__file__).resolve().parent / "data"), help="Root data directory")
+    parser.add_argument("--convolved-dir", type=str, default=None, help="Convolved results directory (overrides data-root/convolved_results)")
+    parser.add_argument("--output-base", type=str, default=None, help="Base output directory (overrides data-root/shifted_downsamples)")
+    args = parser.parse_args()
+
+    # Define offsets to process (could be loaded from a file)
+    offsets = np.array(
+        [
+            [0.0, 0.0],  # dx, dy
+            [0.1, 0.0],
+            [0.0, 0.1],
+            # [-0.1, 0.1],
+            # [-0.1, -0.1],
+        ]
+    )
+
+    # Set mask bits to ignore (0-indexed)
+    ignore_mask_bits = [12]
+
+    main(sector=args.sector, camera=args.camera, ccd=args.ccd, offsets=offsets, ignore_mask_bits=ignore_mask_bits, data_root=args.data_root, convolved_dir=args.convolved_dir, output_base=args.output_base)

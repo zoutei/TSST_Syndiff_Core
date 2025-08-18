@@ -10,6 +10,7 @@ Version: 2.0
 """
 
 # Standard library imports
+import argparse
 import os
 import time
 import warnings
@@ -284,12 +285,26 @@ def find_best_padding_skycell(target_skycell, padding_corners, all_skycells):
             combined_coverage = calculate_overlap(padding_region, combined_polygon)
 
             if combined_coverage >= 99.9:  # Allow for small numerical errors
-                combined_solutions.append({"skycells": [overlapping_candidates[i]["skycell_id"], overlapping_candidates[j]["skycell_id"]], "projections": [overlapping_candidates[i]["projection"], overlapping_candidates[j]["projection"]], "coverage": combined_coverage, "avg_distance": (overlapping_candidates[i]["distance"] + overlapping_candidates[j]["distance"]) / 2})
+                combined_solutions.append(
+                    {
+                        "skycells": [overlapping_candidates[i]["skycell_id"], overlapping_candidates[j]["skycell_id"]],
+                        "projections": [overlapping_candidates[i]["projection"], overlapping_candidates[j]["projection"]],
+                        "coverage": combined_coverage,
+                        "avg_distance": (overlapping_candidates[i]["distance"] + overlapping_candidates[j]["distance"]) / 2,
+                    }
+                )
 
     # Sort combined solutions by average distance
     combined_solutions.sort(key=lambda x: x["avg_distance"])
 
-    return {"status": "partial_coverage" if not combined_solutions else "combined_coverage", "best_match": overlapping_candidates[0]["skycell_id"], "best_match_proj": overlapping_candidates[0]["projection"], "coverage": overlapping_candidates[0]["coverage"], "distance": overlapping_candidates[0]["distance"], "combined_solutions": combined_solutions}
+    return {
+        "status": "partial_coverage" if not combined_solutions else "combined_coverage",
+        "best_match": overlapping_candidates[0]["skycell_id"],
+        "best_match_proj": overlapping_candidates[0]["projection"],
+        "coverage": overlapping_candidates[0]["coverage"],
+        "distance": overlapping_candidates[0]["distance"],
+        "combined_solutions": combined_solutions,
+    }
 
 
 def parse_special_padding_flags(flags_str):
@@ -731,7 +746,7 @@ def load_tess_image(tess_file):
     data_shape = np.shape(data)
     ra_center, dec_center = wcs.all_pix2world(data_shape[1] / 2, data_shape[0] / 2, 0)
 
-    sector = tess_file.split("/")[-1].split("-")[1][1:]
+    sector = int(tess_file.split("/")[-1].split("-")[1][1:])
     camera = int(header["CAMERA"])  # camera_id (1-4)
     ccd = int(header["CCD"])  # ccd_id (1-4)
 
@@ -946,6 +961,28 @@ def process_skycell_pixel_mapping(tess_wcs, tpix_coord_input, ps1_wcs, ps1_data_
     return fll_1d_vec.reshape(ps1_data_shape[0], ps1_data_shape[1])
 
 
+def create_master_fits_header(tess_header, file_name):
+    """
+    Create a master FITS header for the output file.
+
+    Args:
+        tess_header (Header): Original TESS header
+        file_name (str): Name of the output file
+
+    Returns:
+        Header: Processed FITS header
+    """
+    tess_header_master = deepcopy(tess_header)
+    date_mod = datetime.now().strftime("%Y-%m-%d")
+
+    tess_header_master["TESS_FFI"] = file_name
+    tess_header_master["DATE-MOD"] = date_mod
+    tess_header_master["SOFTWARE"] = "SynDiff"
+    tess_header_master["CREATOR"] = "PanCAKES_v2"
+
+    return tess_header_master
+
+
 def create_fits_header(tess_header, skycell_name=None):
     """
     Create standardized FITS header for output files.
@@ -973,9 +1010,6 @@ def create_fits_header(tess_header, skycell_name=None):
     dict_for_header["DATE-MOD"] = date_mod
     dict_for_header["SOFTWARE"] = "SynDiff"
     dict_for_header["CREATOR"] = "PanCAKES_v2"
-    dict_for_header["SVERSION"] = 2.0
-    dict_for_header["BSCALE"] = 1.0
-    dict_for_header["BZERO"] = 32768.0
 
     if skycell_name:
         dict_for_header["SKYCELL"] = skycell_name
@@ -1013,7 +1047,7 @@ def save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, o
     mapping_array[mapping_array == -1] = -1  # Ensure -1 for unmapped pixels
 
     # Create FITS file
-    file_path = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name)
+    file_path = os.path.join(output_path, f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name)
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     primary_hdu = fits.PrimaryHDU(header=new_fits_header)
     image_hdu = fits.ImageHDU(data=np.int64(mapping_array), header=new_fits_header_extended)
@@ -1031,7 +1065,7 @@ def save_skycell_mapping(mapping_array, skycell_name, tess_header, ps1_header, o
     os.system(compress_cmd)
 
 
-def save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header, data_shape, output_path, sector, camera_id, ccd_id, overwrite=True):
+def save_master_mapping(tess_pix_skycell_mapping, selected_skycells, ffi_file_name, tess_header, data_shape, output_path, sector, camera_id, ccd_id, overwrite=True):
     """
     Save master TESS-to-skycell mapping file.
 
@@ -1047,20 +1081,20 @@ def save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header
         overwrite (bool): Whether to overwrite existing files
     """
     # Create filename
-    file_name = f"tess_s{sector}_{camera_id}_{ccd_id}_master_pixels2skycells.fits"
-    file_name_csv = f"tess_s{sector}_{camera_id}_{ccd_id}_master_skycells_list.csv"
+    file_name = f"tess_s{sector:04d}_{camera_id}_{ccd_id}_master_pixels2skycells.fits"
+    file_name_csv = f"tess_s{sector:04d}_{camera_id}_{ccd_id}_master_skycells_list.csv"
 
-    file_path_csv = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name_csv)
+    file_path_csv = os.path.join(output_path, f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name_csv)
     os.makedirs(os.path.dirname(file_path_csv), exist_ok=True)
     selected_skycells.to_csv(file_path_csv)
 
     # Create header
-    master_header = create_fits_header(tess_header)
+    master_header = create_master_fits_header(tess_header, ffi_file_name)
     master_header["DATE-MOD"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
 
     # Create FITS file
-    file_path = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name)
-    primary_hdu = fits.PrimaryHDU(header=master_header)
+    file_path = os.path.join(output_path, f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name)
+    primary_hdu = fits.PrimaryHDU()
 
     # Reshape mapping to 2D and save
     mapping_2d = tess_pix_skycell_mapping.reshape(data_shape)
@@ -1288,8 +1322,8 @@ def save_updated_skycell_csv(selected_skycells, output_path, sector, camera_id, 
     """
     # Start with the selected_skycells dataframe (only processed skycells)
     # Save updated CSV (only processed skycells)
-    file_name_csv = f"tess_s{sector}_{camera_id}_{ccd_id}_master_skycells_list.csv"
-    file_path_csv = os.path.join(output_path, f"sector_{sector}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name_csv)
+    file_name_csv = f"tess_s{sector:04d}_{camera_id}_{ccd_id}_master_skycells_list.csv"
+    file_path_csv = os.path.join(output_path, f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}", file_name_csv)
     os.makedirs(os.path.dirname(file_path_csv), exist_ok=True)
 
     selected_skycells.to_csv(file_path_csv, index=False)
@@ -1301,7 +1335,7 @@ def save_updated_skycell_csv(selected_skycells, output_path, sector, camera_id, 
 # ============================================================================
 
 
-def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, pad_distance=500, edge_exclusion=10, edge_buffer_large=410, edge_buffer_small=70, buffer=200, tess_buffer=150, n_threads=8, overwrite=True, max_workers=None):
+def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, pad_distance=480, edge_exclusion=10, edge_buffer_large=410, edge_buffer_small=70, buffer=200, tess_buffer=150, n_threads=8, overwrite=True, max_workers=None):
     """
     Main optimized pipeline for processing TESS images with PanSTARRS1 skycells.
 
@@ -1365,7 +1399,8 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, pad_di
 
     # Save master mapping
     print("Saving master TESS-to-skycell mapping...")
-    save_master_mapping(tess_pix_skycell_mapping, selected_skycells, tess_header, data_shape, output_path, sector, camera_id, ccd_id, overwrite)
+    ffi_file_name = os.path.basename(tess_file)
+    save_master_mapping(tess_pix_skycell_mapping, selected_skycells, ffi_file_name, tess_header, data_shape, output_path, sector, camera_id, ccd_id, overwrite)
     print(f"Processing time: {(time.time() - start_time):.2f} seconds")
 
     # Process each skycell
@@ -1419,7 +1454,18 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, pad_di
 
     total_time = time.time() - start_time
 
-    results = {"status": "success", "tess_file": tess_file, "total_skycells_found": len(complete_wcs_skycells), "selected_skycells": len(selected_skycells), "processed_skycells": processed_skycells, "skipped_skycells": skipped_skycells, "processing_time_seconds": total_time, "data_shape": data_shape, "ra_center": ra_center, "dec_center": dec_center}
+    results = {
+        "status": "success",
+        "tess_file": tess_file,
+        "total_skycells_found": len(complete_wcs_skycells),
+        "selected_skycells": len(selected_skycells),
+        "processed_skycells": processed_skycells,
+        "skipped_skycells": skipped_skycells,
+        "processing_time_seconds": total_time,
+        "data_shape": data_shape,
+        "ra_center": ra_center,
+        "dec_center": dec_center,
+    }
 
     print("\nProcessing complete!")
     print(f"Total time: {total_time:.2f} seconds")
@@ -1430,16 +1476,48 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, pad_di
 
 
 if __name__ == "__main__":
-    # Example usage
-    # tess_file = "./data/tess/tess2024356001253-s0087-1-3-0284-s_ffic.fits"
-    tess_file = "./data/tess_ffi/20_3_3/tess2020019142923-s0020-3-3-0165-s_ffic.fits"
-    skycell_wcs_csv = "./data/SkyCells/skycell_wcs.csv"
-    output_path = "./data/skycell_pixel_mapping"
+    parser = argparse.ArgumentParser(description="Process a TESS FITS file and generate PS1 skycell pixel mappings.")
 
-    # Create output directory if it doesn't exist
-    os.makedirs(output_path, exist_ok=True)
+    # Positional required argument
+    parser.add_argument("tess_file", help="Path to the TESS FITS file (positional, required)")
 
-    # Process TESS image
-    results = process_tess_image_optimized(tess_file=tess_file, skycell_wcs_csv=skycell_wcs_csv, output_path=output_path, pad_distance=500, edge_exclusion=10, buffer=200, tess_buffer=150, n_threads=8, overwrite=True, max_workers=8)
+    # Optional arguments (defaults chosen to match previous hard-coded values)
+    parser.add_argument("--skycell_wcs_csv", default="./data/SkyCells/skycell_wcs.csv", help="Path to skycell WCS CSV file")
+    parser.add_argument("--output_path", default="./data/skycell_pixel_mapping", help="Output directory for mapping files")
+    parser.add_argument("--pad_distance", type=int, default=480, help="Pad distance in pixels for padding checks")
+    parser.add_argument("--edge_exclusion", type=int, default=10, help="Edge exclusion in pixels for padding checks")
+    parser.add_argument("--edge_buffer_large", type=int, default=410, help="Large edge buffer for WCS corner expansion")
+    parser.add_argument("--edge_buffer_small", type=int, default=70, help="Small edge buffer for WCS corner expansion")
+    parser.add_argument("--buffer", type=int, default=200, help="General buffer size in pixels")
+    parser.add_argument("--tess_buffer", type=int, default=150, help="TESS footprint buffer in pixels used for MOC filtering")
+    parser.add_argument("--n_threads", type=int, default=8, help="Number of threads to use in MOC filtering")
+    parser.add_argument("--max_workers", type=int, default=None, help="Max workers for ProcessPoolExecutor (default: auto)")
+
+    # Overwrite default preserved (default True). Provide flags to explicitly enable/disable.
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--overwrite", dest="overwrite", action="store_true", help="Overwrite existing output files (default)")
+    group.add_argument("--no-overwrite", dest="overwrite", action="store_false", help="Do not overwrite existing output files")
+    parser.set_defaults(overwrite=True)
+
+    args = parser.parse_args()
+
+    # Ensure output directory exists
+    os.makedirs(args.output_path, exist_ok=True)
+
+    # Call the processing function with parsed arguments
+    results = process_tess_image_optimized(
+        tess_file=args.tess_file,
+        skycell_wcs_csv=args.skycell_wcs_csv,
+        output_path=args.output_path,
+        pad_distance=args.pad_distance,
+        edge_exclusion=args.edge_exclusion,
+        edge_buffer_large=args.edge_buffer_large,
+        edge_buffer_small=args.edge_buffer_small,
+        buffer=args.buffer,
+        tess_buffer=args.tess_buffer,
+        n_threads=args.n_threads,
+        overwrite=args.overwrite,
+        max_workers=args.max_workers,
+    )
 
     print(f"Processing results: {results}")

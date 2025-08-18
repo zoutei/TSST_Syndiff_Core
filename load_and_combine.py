@@ -32,11 +32,11 @@ def _producer_loader(tasks_queue, processed_queue, zarr_path):
 
         try:
             logger.info(f"[Producer] Loading data for {projection}/{skycell}...")
-            # Use the parallel loader for a single skycell's bands/masks
-            bands, masks = zarr_utils.load_skycell_bands_and_masks(zarr_path, projection, skycell)
+            # Use the parallel loader for a single skycell's bands/masks/headers
+            bands, masks, headers = zarr_utils.load_skycell_bands_masks_and_headers(zarr_path, projection, skycell)
             if bands:
-                # Put the loaded raw data onto the queue for consumers
-                processed_queue.put(("data", projection, skycell, bands))
+                # Put the loaded raw data onto the queue for consumers (include headers)
+                processed_queue.put(("data", projection, skycell, bands, headers))
             if masks:
                 # Masks are optional, so only add if they exist
                 processed_queue.put(("mask", projection, skycell, masks))
@@ -62,13 +62,17 @@ def _consumer_processor(processed_queue, results_dict):
         if item is None:
             break  # Sentinel value received, exit loop
 
-        item_type, projection, skycell, data = item
+        if len(item) == 5:  # data item with headers
+            item_type, projection, skycell, data, headers = item
+        else:  # mask item
+            item_type, projection, skycell, data = item
+            headers = None
 
         try:
             if item_type == "data":
                 logger.info(f"[Consumer] Processing bands for {projection}/{skycell}...")
-                # This is the CPU-bound part
-                combined_image, _ = band_utils.process_skycell_bands(data, None)
+                # This is the CPU-bound part - include headers for proper flux conversion
+                combined_image, _ = band_utils.process_skycell_bands(data, None, headers)
 
                 # Store the result - need to handle Manager dict properly
                 key = f"{projection}/{skycell}"

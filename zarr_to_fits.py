@@ -223,7 +223,7 @@ def main():
 
     parser.add_argument("--zarr-path", type=str, default="data/ps1_skycells_zarr/ps1_skycells.zarr", help="Path to the Zarr store")
 
-    parser.add_argument("--skycell", type=str, help="Skycell name (e.g., rings.v3.skycell.0306.067)")
+    parser.add_argument("--skycell", type=str, help="Skycell name (e.g., skycell.0306.067)")
 
     parser.add_argument("--band", type=str, choices=["r", "i", "z", "y"], help="Band to extract (r, i, z, y). If not specified, extracts all bands")
 
