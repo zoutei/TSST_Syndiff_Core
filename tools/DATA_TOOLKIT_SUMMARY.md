@@ -1,6 +1,6 @@
-# PS1 Data Processing Toolkit - Summary
+# Zarr Data Processing Toolkit - Summary
 
-This document summarizes the comprehensive PS1 data processing toolkit that has been created, including inventory, extraction, and download capabilities with both command-line and programmatic interfaces.
+This document summarizes the comprehensive Zarr data processing toolkit that has been created, including inventory, extraction, and download capabilities with both command-line and programmatic interfaces.
 
 ## Overview
 
@@ -17,6 +17,7 @@ The toolkit consists of three main scripts that work together to provide a compl
 **Purpose**: Analyze Zarr store health and perform cleanup operations
 
 **Command-line Usage**:
+
 ```bash
 python zarr_inventory.py                           # Basic analysis
 python zarr_inventory.py --cleanup-temp --dry-run  # Preview temp cleanup
@@ -24,6 +25,7 @@ python zarr_inventory.py --cleanup-all             # Clean everything
 ```
 
 **Key Features**:
+
 - Detects corruption, incomplete data, temporary arrays
 - Supports dry-run mode for safe preview
 - Provides detailed statistics and cleanup options
@@ -34,6 +36,7 @@ python zarr_inventory.py --cleanup-all             # Clean everything
 **Purpose**: Extract data from Zarr store and convert back to FITS files
 
 **Command-line Usage**:
+
 ```bash
 # Extract single skycell
 python zarr_to_fits.py --skycell skycell.012345.006789.stk.v3.skycell.unconv --band g
@@ -46,6 +49,7 @@ python zarr_to_fits.py --list
 ```
 
 **Key Features**:
+
 - Single and batch extraction modes
 - Reconstructs proper FITS headers
 - Handles both old and new Zarr structure formats
@@ -56,6 +60,7 @@ python zarr_to_fits.py --list
 **Purpose**: Download PS1 data with local file fallback and callable function interface
 
 **Command-line Usage**:
+
 ```bash
 # Basic download
 python download_and_store_zarr.py
@@ -68,6 +73,7 @@ python download_and_store_zarr.py --sector 21 --camera 2 --ccd 1 --num-workers 1
 ```
 
 **Programmatic Usage**:
+
 ```python
 from download_and_store_zarr import download_and_store_ps1_data
 
@@ -89,6 +95,7 @@ if result['status'] == 'completed':
 ```
 
 **Key Features**:
+
 - **Local file support**: Checks for local FITS files before downloading
 - **Callable function**: Can be imported and used from other Python scripts
 - **Return values**: Provides structured results with status and metadata
@@ -99,16 +106,19 @@ if result['status'] == 'completed':
 ## New Capabilities Added
 
 ### Local File Support
+
 - The download script now checks for locally available FITS files before attempting downloads
 - Configurable local data path (default: `data/ps1_skycells`)
 - Graceful fallback to download mode if local files are not found
 
 ### Callable Function Interface
+
 - `download_and_store_ps1_data()` function can be imported and called from other scripts
 - Returns structured results with processing status and metadata
 - Enables programmatic batch processing and integration workflows
 
 ### Enhanced Error Handling
+
 - Structured return values with status codes ('completed', 'error', 'interrupted')
 - Detailed error messages for troubleshooting
 - Graceful handling of missing configuration files
@@ -116,6 +126,7 @@ if result['status'] == 'completed':
 ## Example Workflows
 
 ### 1. Data Management Workflow
+
 ```bash
 # 1. Analyze current Zarr store
 python zarr_inventory.py
@@ -128,6 +139,7 @@ python zarr_to_fits.py --skycell TARGET_SKYCELL --band g --output extracted_data
 ```
 
 ### 2. Batch Processing Workflow
+
 ```python
 # Python script for batch processing multiple configurations
 from download_and_store_zarr import download_and_store_ps1_data
@@ -144,6 +156,7 @@ for config in configurations:
 ```
 
 ### 3. Local Data Processing
+
 ```bash
 # Use local files when available, fall back to download
 python download_and_store_zarr.py --use-local-files --local-data-path "data/ps1_skycells"
