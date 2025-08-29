@@ -1,48 +1,49 @@
 """
 Modern Sliding Window Pipeline Implementation
 
-Function-oriented implementation of the PS1 Simplified Processing Specification
-using a sliding window approach with master arrays for efficient row-based processing.
+Refactored to use a high-throughput, memory-efficient, four-stage pipeline.
+This version uses parallel upstream workers for data ingestion and preprocessing,
+feeding a single, sequential assembler that processes one projection at a time
+to correctly manage the sliding window state.
 """
 
 import gc
 import logging
+import os
+import signal
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from multiprocessing import Manager
+from multiprocessing import Process, Queue
+from queue import Empty
 from typing import Optional
 
 import numpy as np
-from astropy.wcs import WCS
+import pandas as pd
+import zarr
 
 # Import existing utilities
+import band_utils
+import convolution_utils
+import zarr_utils
 from band_utils import process_skycell_bands
-from convolution_utils import apply_gaussian_convolution
-from csv_utils import load_csv_data
+from csv_utils import find_csv_file, get_projections_from_csv, load_csv_data
 from zarr_utils import load_skycell_bands_masks_and_headers
 
 logger = logging.getLogger(__name__)
 
+_child_processes = []
+
 # Key constants from the specification
-CELL_OVERLAP = 480  # Natural overlap between adjacent cells
-EDGE_EXCLUSION = 10  # Amount to overwrite for smooth blending
-EFFECTIVE_OVERLAP = CELL_OVERLAP - EDGE_EXCLUSION  # 470 pixels
-PAD_SIZE = 480  # Padding around each row
+CELL_OVERLAP = 480
+EDGE_EXCLUSION = 10
+EFFECTIVE_OVERLAP = CELL_OVERLAP - EDGE_EXCLUSION
+PAD_SIZE = 480
+GATHER_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
-@dataclass
-class CellInfo:
-    """Information about a single cell."""
-
-    name: str
-    projection: str
-    row_id: int
-    x_coord: int
-    cell_index: int
-    width: int
-    height: int
-
-
+# --- Data Structures (Retained) ---
 @dataclass
 class MasterArrayConfig:
     """Configuration for master arrays."""
@@ -52,24 +53,8 @@ class MasterArrayConfig:
     cell_width: int
     cell_height: int
     max_cells: int
-    cell_dimensions: dict  # mapping cell_name -> (width, height)
-
-
-@dataclass
-class PaddingCell:
-    """Information about a cell used for padding."""
-
-    name: str
-    projection: str
-    loaded: bool = False
-    used_for: list[str] = None  # list of rows this cell is padding
-    locations: list[str] = None  # list of locations like "top", "bottom"
-
-    def __post_init__(self):
-        if self.used_for is None:
-            self.used_for = []
-        if self.locations is None:
-            self.locations = []
+    starting_x: int
+    cell_dimensions: dict
 
 
 @dataclass
@@ -78,13 +63,12 @@ class ProcessingState:
 
     current_array: Optional[np.ndarray] = None
     next_array: Optional[np.ndarray] = None
-    current_masks: dict[str, np.ndarray] = None  # current row masks
-    next_masks: dict[str, np.ndarray] = None  # next row masks
+    current_masks: dict[str, np.ndarray] = None
+    next_masks: dict[str, np.ndarray] = None
     current_row_id: Optional[int] = None
     next_row_id: Optional[int] = None
-    cell_locations: dict[str, tuple[int, int, int, int]] = None  # name -> (x_start, x_end, y_start, y_end)
-    next_cell_locations: dict[str, tuple[int, int, int, int]] = None  # next row cell locations
-    padding_cells: dict[str, PaddingCell] = None  # name -> PaddingCell
+    cell_locations: dict[str, tuple[int, int, int, int]] = None
+    next_cell_locations: dict[str, tuple[int, int, int, int]] = None
 
     def __post_init__(self):
         if self.current_masks is None:
@@ -95,351 +79,29 @@ class ProcessingState:
             self.cell_locations = {}
         if self.next_cell_locations is None:
             self.next_cell_locations = {}
-        if self.padding_cells is None:
-            self.padding_cells = {}
 
 
-def extract_projection_metadata(csv_path: str, projection: str) -> dict:
-    """Extract projection metadata from CSV file."""
-    df = load_csv_data(csv_path)
-    proj_df = df[df["projection"].astype(str) == projection]
-
-    if len(proj_df) == 0:
-        raise ValueError(f"No data found for projection {projection}")
-
-    # Extract row information
-    rows = {}
-    cell_dimensions = {}
-    for _, row in proj_df.iterrows():
-        row_id = int(row["y"])
-        cell_name = row["NAME"]
-        x_coord = int(row["x"])
-
-        # Store actual cell dimensions
-        cell_width = int(row.get("NAXIS1"))
-        cell_height = int(row.get("NAXIS2"))
-        cell_dimensions[cell_name] = (cell_width, cell_height)
-
-        if row_id not in rows:
-            rows[row_id] = []
-        rows[row_id].append((cell_name, x_coord))
-
-    # Sort cells within each row by x coordinate
-    for row_id in rows:
-        rows[row_id].sort(key=lambda x: x[1])
-        rows[row_id] = [cell_name for cell_name, _ in rows[row_id]]
-
-    # Get typical cell dimensions (use most common size)
-    # Check all cell dimensions are the same
-    all_dims = list(cell_dimensions.values())
-    if len(set(all_dims)) == 1:
-        typical_width, typical_height = all_dims[0]
-    else:
-        raise ValueError(f"Not all cell dimensions are the same: found {set(all_dims)}")
-
-    # Calculate max cells per row
-    max_cells_per_row = max(len(cells) for cells in rows.values()) if rows else 0
-
-    logger.info(f"Found {len(cell_dimensions)} cells with dimensions ranging from typical {typical_width}x{typical_height}")
-
-    return {"projection": projection, "rows": rows, "cell_width": typical_width, "cell_height": typical_height, "max_cells_per_row": max_cells_per_row, "cell_dimensions": cell_dimensions, "dataframe": proj_df}
-
-
-def create_master_array_config(metadata: dict) -> MasterArrayConfig:
-    """Create master array configuration from metadata."""
-    cell_width = metadata["cell_width"]
-    cell_height = metadata["cell_height"]
-    max_cells = metadata["max_cells_per_row"]
-    cell_dimensions = metadata["cell_dimensions"]
-
-    master_width = (max_cells * cell_width) + (2 * PAD_SIZE)
-    master_height = cell_height + (2 * PAD_SIZE)
-
-    return MasterArrayConfig(width=master_width, height=master_height, cell_width=cell_width, cell_height=cell_height, max_cells=max_cells, cell_dimensions=cell_dimensions)
+# --- Core Logic Functions (Retained and Modified) ---
 
 
 def initialize_processing_state(config: MasterArrayConfig) -> ProcessingState:
     """Initialize processing state with empty master arrays."""
-    current_array = np.zeros((config.height, config.width), dtype=np.float32)
-    next_array = np.zeros((config.height, config.width), dtype=np.float32)
-
+    current_array = np.full((config.height, config.width), np.nan, dtype=np.float32)
+    next_array = np.full((config.height, config.width), np.nan, dtype=np.float32)
     return ProcessingState(current_array=current_array, next_array=next_array)
 
 
-def _parallel_cell_loader(tasks_queue, results_queue, zarr_path):
-    """
-    Producer function: loads cell data using threads.
-    Pulls cell tasks from the queue and loads their data.
-    """
-    while True:
-        try:
-            task = tasks_queue.get_nowait()
-        except Exception:
-            break  # No more tasks
-
-        cell_name, projection, cell_index = task
-
-        try:
-            logger.debug(f"[Loader] Loading cell {cell_name} (index {cell_index})")
-            # Load and combine bands using parallel loading with headers
-            bands_data, masks_data, headers_data = load_skycell_bands_masks_and_headers(zarr_path, projection, cell_name)
-            combined_image, combined_mask = process_skycell_bands(bands_data, masks_data, headers_data)
-
-            # Put the loaded data onto the results queue
-            results_queue.put(("success", cell_name, cell_index, combined_image, combined_mask))
-
-        except Exception as e:
-            logger.warning(f"[Loader] Failed to load cell {cell_name}: {e}")
-            results_queue.put(("error", cell_name, cell_index, None, None))
-
-    logger.debug("Cell loader finished")
-
-
-def _parallel_cell_processor(results_queue, target_array, config: MasterArrayConfig, cell_x_coords: dict, first_x_coord: int, num_cells: int):
-    """
-    Consumer function: processes loaded cell data and places in target array.
-    """
-    processed_count = 0
-    cell_positions = {}
-    cell_masks = {}
-
-    while processed_count < num_cells:
-        try:
-            result = results_queue.get(timeout=30)  # 30 second timeout
-        except Exception:
-            logger.warning("Timeout waiting for cell data")
-            break
-
-        status, cell_name, loaded_cell_index, combined_image, combined_mask = result
-
-        if status != "success" or combined_image is None:
-            logger.warning(f"[Processor] Skipping failed cell {cell_name}")
-            processed_count += 1
-            continue
-
-        try:
-            logger.debug(f"[Processor] Processing cell {cell_name}")
-
-            # Calculate cell_index relative to the first cell in this row
-            cell_index = cell_x_coords[cell_name] - first_x_coord if cell_name in cell_x_coords else loaded_cell_index
-
-            # Get actual cell dimensions from config
-            actual_width, actual_height = config.cell_dimensions.get(cell_name, (config.cell_width, config.cell_height))
-
-            # Use actual loaded dimensions for calculation
-            loaded_height, loaded_width = combined_image.shape
-
-            # Calculate position using standard cell width for positioning, INCLUDE PAD_SIZE
-            target_x_start_full = PAD_SIZE + cell_index * (config.cell_width - CELL_OVERLAP)
-            target_x_end = target_x_start_full + config.cell_width
-            target_y_start = PAD_SIZE
-            target_y_end = target_y_start + config.cell_height
-
-            # Handle overlap for source region
-            if cell_index == 0:
-                # First cell: use full width
-                source_x_start, source_x_end = 0, loaded_width
-                target_x_start = target_x_start_full
-            else:
-                # Subsequent cells: skip overlap region if possible
-                source_x_start = EFFECTIVE_OVERLAP
-                source_x_end = loaded_width
-                target_x_start = target_x_start_full + EFFECTIVE_OVERLAP
-
-            source_y_start, source_y_end = 0, loaded_height
-
-            # Place the cell and store results
-            target_array[target_y_start:target_y_end, target_x_start:target_x_end] = combined_image[source_y_start:source_y_end, source_x_start:source_x_end]
-
-            logger.debug(f"Placed {cell_name} ({loaded_width}x{loaded_height}) at target[{target_y_start}:{target_y_end}, {target_x_start}:{target_x_end}] from source[{source_y_start}:{source_y_end}, {source_x_start}:{source_x_end}]")
-
-            # Extract the mask region that was actually placed
-            cell_positions[cell_name] = (target_x_start_full, target_x_end, target_y_start, target_y_end)
-            cell_masks[cell_name] = combined_mask
-            logger.debug(f"Successfully placed cell {cell_name} at position ({target_x_start}, {target_x_end}, {target_y_start}, {target_y_end})")
-
-        except Exception as e:
-            logger.warning(f"[Processor] Failed to process cell {cell_name}: {e}")
-
-        processed_count += 1
-
-    logger.debug(f"Cell processor finished: {len(cell_positions)}/{num_cells} cells successfully processed")
-    return cell_positions, cell_masks
-
-
-def load_row_into_array_parallel(zarr_path: str, projection: str, row_cells: list[str], target_array: np.ndarray, config: MasterArrayConfig, metadata: dict, num_loaders: int = 4) -> tuple[dict[str, tuple[int, int, int, int]], dict[str, np.ndarray]]:
-    """Load a complete row of cells into target array using parallel loading.
-
-    Returns:
-        Tuple of (cell_positions, cell_masks)
-    """
-    logger.info(f"Loading row with {len(row_cells)} cells in parallel: {row_cells}")
-    target_array.fill(np.nan)  # Clear array
-
-    if not row_cells:
-        return {}, {}
-
-    # Get the minimum x-coordinate to handle non-zero starting indices
-    proj_df = metadata["dataframe"]
-    first_x_coord = None
-    cell_x_coords = {}
-
-    for cell_name in row_cells:
-        cell_row = proj_df[proj_df["NAME"] == cell_name]
-        if not cell_row.empty:
-            x_coord = int(cell_row.iloc[0]["x"])
-            cell_x_coords[cell_name] = x_coord
-            if first_x_coord is None:
-                first_x_coord = x_coord
-            else:
-                first_x_coord = min(first_x_coord, x_coord)
-
-    # Use multiprocessing Manager for thread-safe communication
-    with Manager() as manager:
-        tasks_queue = manager.Queue()
-        results_queue = manager.Queue()
-
-        # Add all cell loading tasks to the queue
-        for i, cell_name in enumerate(row_cells):
-            tasks_queue.put((cell_name, projection, i))
-
-        # Start loader threads
-        with ThreadPoolExecutor(max_workers=num_loaders) as executor:
-            # Start loaders
-            for _ in range(num_loaders):
-                executor.submit(_parallel_cell_loader, tasks_queue, results_queue, zarr_path)
-
-        # Process results in main thread to avoid array sharing issues
-        cell_positions, cell_masks = _parallel_cell_processor(results_queue, target_array, config, cell_x_coords, first_x_coord, len(row_cells))
-
-    logger.info(f"Parallel row loading complete: {len(cell_positions)}/{len(row_cells)} cells successfully loaded")
-    return cell_positions, cell_masks
-
-
-def calculate_cell_position(cell_index: int, config: MasterArrayConfig) -> tuple[int, int, int, int]:
-    """Calculate cell position in master array with overlap handling."""
-    if cell_index == 0:
-        # First cell: place normally
-        x_start = PAD_SIZE
-        x_end = PAD_SIZE + config.cell_width
-    else:
-        # Subsequent cells: handle overlap
-        x_start = PAD_SIZE + (config.cell_width - EFFECTIVE_OVERLAP) * cell_index - EDGE_EXCLUSION
-        x_end = x_start + config.cell_width
-
-    y_start = PAD_SIZE
-    y_end = PAD_SIZE + config.cell_height
-
-    return x_start, x_end, y_start, y_end
-
-
-def load_and_place_cell(zarr_path: str, cell_name: str, projection: str, cell_index: int, target_array: np.ndarray, config: MasterArrayConfig) -> tuple[int, int, int, int, np.ndarray]:
-    """Load a cell and place it in the target array with overlap handling.
-
-    Returns:
-        Tuple of (x_start, x_end, y_start, y_end, combined_mask_uint16)
-    """
-    try:
-        # logger.info(f"Loading cell {cell_name} (index {cell_index}) from projection {projection}")
-
-        # Load and combine bands using parallel loading with headers
-        bands_data, masks_data, headers_data = load_skycell_bands_masks_and_headers(zarr_path, projection, cell_name)
-        combined_image, combined_mask = process_skycell_bands(bands_data, masks_data, headers_data)
-
-        # Get actual cell dimensions from config
-        actual_width, actual_height = config.cell_dimensions.get(cell_name, (config.cell_width, config.cell_height))
-
-        # Log dimension mismatch if any
-        if combined_image.shape != (actual_height, actual_width):
-            logger.debug(f"Cell {cell_name} size mismatch: loaded {combined_image.shape}, expected ({actual_height}, {actual_width})")
-
-        # Use actual loaded dimensions for calculation
-        loaded_height, loaded_width = combined_image.shape
-
-        # Calculate position using standard cell width for positioning, INCLUDE PAD_SIZE
-        x_start = PAD_SIZE + cell_index * (config.cell_width - CELL_OVERLAP)
-        y_start = PAD_SIZE
-
-        # Handle overlap for source region
-        if cell_index == 0:
-            # First cell: use full width
-            source_x_start, source_x_end = 0, loaded_width
-        else:
-            # Subsequent cells: skip overlap region if possible
-            source_x_start = EFFECTIVE_OVERLAP
-            source_x_end = loaded_width
-
-        source_y_start, source_y_end = 0, loaded_height
-
-        # Ensure we don't go out of bounds
-        target_x_end = min(x_start + (source_x_end - source_x_start), target_array.shape[1])
-        target_y_end = min(y_start + (source_y_end - source_y_start), target_array.shape[0])
-
-        # Adjust source to match actual target size
-        target_width = target_x_end - x_start
-        target_height = target_y_end - y_start
-        source_x_end = min(source_x_start + target_width, loaded_width)
-        source_y_end = min(source_y_start + target_height, loaded_height)
-
-        # Place the cell and return mask
-        if target_x_end > x_start and target_y_end > y_start and source_x_end > source_x_start and source_y_end > source_y_start:
-            target_array[y_start:target_y_end, x_start:target_x_end] = combined_image[source_y_start:source_y_end, source_x_start:source_x_end]
-
-            logger.debug(f"Placed {cell_name} ({loaded_width}x{loaded_height}) at target[{y_start}:{target_y_end}, {x_start}:{target_x_end}] from source[{source_y_start}:{source_y_end}, {source_x_start}:{source_x_end}]")
-
-            # Extract the mask region that was actually placed
-            extracted_mask = combined_mask[source_y_start:source_y_end, source_x_start:source_x_end]
-            return x_start, target_x_end, y_start, target_y_end, extracted_mask
-        else:
-            logger.warning(f"Could not place cell {cell_name} - invalid region")
-            return 0, 0, 0, 0, np.array([])
-
-    except Exception as e:
-        logger.warning(f"Failed to load cell {cell_name}: {e}")
-        return 0, 0, 0, 0, np.array([])
-
-
-def load_row_into_array(zarr_path: str, projection: str, row_cells: list[str], target_array: np.ndarray, config: MasterArrayConfig, metadata: dict) -> tuple[dict[str, tuple[int, int, int, int]], dict[str, np.ndarray]]:
-    """Load a complete row of cells into target array.
-
-    Returns:
-        Tuple of (cell_positions, cell_masks)
-    """
-    logger.info(f"Loading row with {len(row_cells)} cells: {row_cells}")
-    target_array.fill(0)  # Clear array
-    cell_positions = {}
-    cell_masks = {}
-
-    # Get the minimum x-coordinate to handle non-zero starting indices
-    proj_df = metadata["dataframe"]
-    first_x_coord = None
-    cell_x_coords = {}
-
-    for cell_name in row_cells:
-        cell_row = proj_df[proj_df["NAME"] == cell_name]
-        if not cell_row.empty:
-            x_coord = int(cell_row.iloc[0]["x"])
-            cell_x_coords[cell_name] = x_coord
-            if first_x_coord is None:
-                first_x_coord = x_coord
-            else:
-                first_x_coord = min(first_x_coord, x_coord)
-
-    for cell_name in row_cells:
-        # Calculate cell_index relative to the first cell in this row
-        cell_index = cell_x_coords[cell_name] - first_x_coord if cell_name in cell_x_coords else 0
-
-        logger.info(f"Processing cell {cell_name} (x={cell_x_coords.get(cell_name, 'unknown')}, index={cell_index})")
-        x_start, x_end, y_start, y_end, cell_mask = load_and_place_cell(zarr_path, cell_name, projection, cell_index, target_array, config)
-        if (x_start, x_end, y_start, y_end) != (0, 0, 0, 0):  # Valid position
-            cell_positions[cell_name] = (x_start, x_end, y_start, y_end)
-            cell_masks[cell_name] = cell_mask
-            logger.info(f"Successfully placed cell {cell_name} at position ({x_start}, {x_end}, {y_start}, {y_end})")
-        else:
-            logger.warning(f"Failed to place cell {cell_name}")
-
-    logger.info(f"Row loading complete: {len(cell_positions)}/{len(row_cells)} cells successfully loaded")
-    return cell_positions, cell_masks
+def advance_sliding_window(state: ProcessingState) -> None:
+    """Advance the sliding window (next becomes current)."""
+    state.current_array, state.next_array = state.next_array, state.current_array
+    state.next_array.fill(np.nan)
+    state.current_masks, state.next_masks = state.next_masks, {}
+    state.current_row_id = state.next_row_id
+    state.next_row_id = None
+    state.cell_locations.clear()
+    state.cell_locations.update(state.next_cell_locations)
+    state.next_cell_locations.clear()
+    gc.collect()
 
 
 def apply_cross_row_padding(state: ProcessingState, config: MasterArrayConfig) -> None:
@@ -447,327 +109,477 @@ def apply_cross_row_padding(state: ProcessingState, config: MasterArrayConfig) -
     if state.next_array is None:
         return
 
-    # From next row: take region from EFFECTIVE_OVERLAP to (EFFECTIVE_OVERLAP + PAD_SIZE)
-    # Place into current row: from -EDGE_EXCLUSION (which means near the top padding)
-
     # Source region from next row
     next_source_y_start = PAD_SIZE + CELL_OVERLAP - EDGE_EXCLUSION
     next_source_y_end = PAD_SIZE * 2 + CELL_OVERLAP
 
-    # Target region in current row (top padding area, offset by EDGE_EXCLUSION)
+    # Target region in current row (top padding area)
     current_target_y_start = config.cell_height - EDGE_EXCLUSION + PAD_SIZE
-
     state.current_array[current_target_y_start:, :] = state.next_array[next_source_y_start:next_source_y_end, :]
 
     # Opposite direction: from current to next
-    # Source region from current row
     current_source_y_start = config.cell_height - CELL_OVERLAP
     current_source_y_end = PAD_SIZE + config.cell_height - CELL_OVERLAP + EDGE_EXCLUSION
-
     next_target_y_end = PAD_SIZE + EDGE_EXCLUSION
-
     state.next_array[:next_target_y_end, :] = state.current_array[current_source_y_start:current_source_y_end, :]
 
 
-def extract_cell_results(convolved_array: np.ndarray, cell_positions: dict[str, tuple[int, int, int, int]], config: MasterArrayConfig) -> dict[str, np.ndarray]:
+def extract_cell_results(convolved_array: np.ndarray, cell_positions: dict) -> dict[str, np.ndarray]:
     """Extract individual cell results from convolved array."""
     results = {}
-
     for cell_name, (x_start, x_end, y_start, y_end) in cell_positions.items():
-        try:
-            # Extract the cell region (could add overlap exclusion logic here)
-            extracted = convolved_array[y_start:y_end, x_start:x_end].copy()
-            results[cell_name] = extracted
-
-        except Exception as e:
-            logger.warning(f"Failed to extract {cell_name}: {e}")
-            continue
-
+        results[cell_name] = convolved_array[y_start:y_end, x_start:x_end].copy()
     return results
 
 
-def process_row_sliding_window(zarr_path: str, metadata: dict, config: MasterArrayConfig, state: ProcessingState, current_row_id: int, next_row_id: Optional[int], csv_path: str, psf_sigma: float = 60.0) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """Process a single row using sliding window approach."""
-    logger.info(f"Processing row {current_row_id} (next: {next_row_id})")
-    rows = metadata["rows"]
-    projection = metadata["projection"]
+def extract_projection_metadata(df: pd.DataFrame, projection: str) -> dict:
+    """Extract projection metadata from a pre-loaded DataFrame."""
+    proj_df = df[df["projection"].astype(str) == projection]
+    if proj_df.empty:
+        raise ValueError(f"No data found for projection {projection}")
 
-    # Load current row if not already loaded (first iteration)
+    rows = {}
+    cell_dimensions = {}
+    starting_x = 10
+    for _, row in proj_df.iterrows():
+        row_id = int(row["y"])
+        cell_name = row["NAME"]
+        x_coord = int(row["x"])
+        starting_x = x_coord if x_coord < starting_x else starting_x
+        cell_width = int(row.get("NAXIS1"))
+        cell_height = int(row.get("NAXIS2"))
+        cell_dimensions[cell_name] = (cell_width, cell_height)
+        if row_id not in rows:
+            rows[row_id] = []
+        rows[row_id].append((cell_name, x_coord))
+
+    for row_id in rows:
+        rows[row_id].sort(key=lambda x: x[1])
+
+    all_dims = list(cell_dimensions.values())
+    if len(set(all_dims)) > 1:
+        logger.warning(f"Inconsistent cell dimensions found: {set(all_dims)}")
+    typical_width, typical_height = max(all_dims, key=lambda item: item[0] * item[1]) if all_dims else (0, 0)
+    max_cells_per_row = max(len(cells) for cells in rows.values()) if rows else 0
+
+    return {
+        "projection": projection,
+        "rows": rows,
+        "cell_width": typical_width,
+        "cell_height": typical_height,
+        "max_cells_per_row": max_cells_per_row,
+        "starting_x": starting_x,
+        "cell_dimensions": cell_dimensions,
+        "dataframe": proj_df,
+    }
+
+
+def create_master_array_config(metadata: dict) -> MasterArrayConfig:
+    """Create master array configuration from metadata."""
+    cell_width = metadata["cell_width"]
+    cell_height = metadata["cell_height"]
+    max_cells = metadata["max_cells_per_row"]
+    starting_x = metadata["starting_x"]
+    master_width = PAD_SIZE + (max_cells * (cell_width - CELL_OVERLAP)) + CELL_OVERLAP + PAD_SIZE
+    master_height = cell_height + (2 * PAD_SIZE)
+    return MasterArrayConfig(width=master_width, height=master_height, cell_width=cell_width, cell_height=cell_height, max_cells=max_cells, starting_x=starting_x, cell_dimensions=metadata["cell_dimensions"])
+
+
+def create_master_task_list(df: pd.DataFrame, projection: str) -> tuple[dict, list[tuple[str, str, int]]]:
+    """Generate the task list for a single projection from a pre-loaded DataFrame."""
+    metadata = extract_projection_metadata(df, projection)
+    task_list = []
+    for row_id in sorted(metadata["rows"].keys()):
+        for skycell_id in metadata["rows"][row_id]:
+            task_list.append((skycell_id, projection, row_id))
+    return metadata, task_list
+
+
+# --- NEW Pipeline Worker Functions ---
+
+
+def reader_worker(task_queue: Queue, raw_cell_queue: Queue, zarr_store):
+    """Stage 1: Reads raw cell data from Zarr based on tasks."""
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        skycell_id, projection, row_id, x_coord = task
+        try:
+            bands, masks, headers = zarr_utils.load_skycell_bands_masks_and_headers(zarr_store, projection, skycell_id)
+            if not bands:
+                logger.warning(f"[Reader] No band data for {skycell_id}, skipping.")
+                continue
+            # SPEC: Pass all metadata, including x_coord, to the next stage.
+            raw_bundle = {"skycell_id": skycell_id, "projection": projection, "row_id": row_id, "x_coord": x_coord, "bands_data": bands, "masks_data": masks, "headers_data": headers}
+            raw_cell_queue.put(raw_bundle)
+            logger.info(f"[Reader] Loaded {skycell_id}")
+        except Exception as e:
+            logger.error(f"[Reader] Failed to load {skycell_id}: {e}", exc_info=True)
+
+
+def pre_processor_worker(raw_cell_queue: Queue, combined_cell_queue: Queue):
+    """Stage 2: Combines bands for a single cell."""
+    while True:
+        raw_bundle = raw_cell_queue.get()
+        if raw_bundle is None:
+            break
+        try:
+            combined_image, combined_mask = band_utils.process_skycell_bands(raw_bundle["bands_data"], raw_bundle["masks_data"], raw_bundle["headers_data"])
+            # SPEC: Pass essential metadata through to the assembler stage.
+            combined_bundle = {"skycell_id": raw_bundle["skycell_id"], "projection": raw_bundle["projection"], "row_id": raw_bundle["row_id"], "x_coord": raw_bundle["x_coord"], "combined_image": combined_image, "combined_mask": combined_mask}
+            combined_cell_queue.put(combined_bundle)
+            logger.info(f"[PreProcessor] Processed {raw_bundle['skycell_id']}")
+        except Exception as e:
+            logger.error(f"[PreProcessor] Failed for {raw_bundle['skycell_id']}: {e}", exc_info=True)
+
+
+def saver_worker(results_queue: Queue, output_path: str):
+    """Stage 4: Saves final results to an output Zarr store."""
+    try:
+        output_store = zarr.open(output_path, mode="a")
+        logger.info(f"[Saver] Opened output store {output_path}")
+        while True:
+            processed_bundle = results_queue.get()
+            if processed_bundle is None:
+                break
+            try:
+                zarr_utils.save_convolved_results(output_store, processed_bundle["projection"], processed_bundle["row_id"], processed_bundle["results_data"], processed_bundle["results_masks"])
+                logger.info(f"[Saver] Saved row {processed_bundle['row_id']} for projection {processed_bundle['projection']}")
+            except Exception as e:
+                logger.error(f"[Saver] Failed saving row {processed_bundle['row_id']}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"[Saver] Failed opening output store at {output_path}: {e}", exc_info=True)
+
+
+# --- NEW: Sequential Assembler & Convolution (Stage 3) ---
+
+
+def assemble_row_from_bundles(target_array: np.ndarray, cell_bundles: list[dict], config: MasterArrayConfig) -> tuple[dict, dict]:
+    """
+    SPEC: Assembles a master row image from a pre-gathered list of cell bundles.
+    This function is purely for image assembly and does not interact with queues.
+    """
+    target_array.fill(np.nan)
+    cell_positions = {}
+    cell_masks = {}
+    first_x_coord = config.starting_x
+
+    for bundle in cell_bundles:
+        cell_name = bundle["skycell_id"]
+        image = bundle["combined_image"]
+        mask = bundle["combined_mask"]
+        x_coord = bundle["x_coord"]
+        cell_index = x_coord - first_x_coord
+
+        target_y_start = PAD_SIZE
+        target_x_start_full = PAD_SIZE + cell_index * (config.cell_width - CELL_OVERLAP)
+
+        if cell_index == 0:
+            source_x_start = 0
+            target_x_start = target_x_start_full
+        else:
+            source_x_start = EFFECTIVE_OVERLAP
+            target_x_start = target_x_start_full + EFFECTIVE_OVERLAP
+
+        source_height, source_width = image.shape
+        place_width = source_width - source_x_start
+        place_height = source_height
+
+        target_x_end = target_x_start + place_width
+        target_y_end = target_y_start + place_height
+
+        if target_x_end <= target_array.shape[1] and target_y_end <= target_array.shape[0]:
+            target_array[target_y_start:target_y_end, target_x_start:target_x_end] = image[:, source_x_start:]
+            cell_masks[cell_name] = mask
+            cell_positions[cell_name] = (target_x_start_full, target_x_start_full + config.cell_width, PAD_SIZE, PAD_SIZE + config.cell_height)
+        else:
+            logger.warning(f"Cell {cell_name} out of bounds for master array. Skipping placement.")
+
+    logger.info(f"Assembled row with {len(cell_bundles)} cells.")
+    return cell_positions, cell_masks
+
+
+def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined_cell_queue: Queue, cell_buffer: dict, zarr_path: str) -> list[dict]:
+    """
+    Gathers all necessary cell bundles for a given row from the queue.
+    Handles out-of-order arrivals using a buffer and has a timeout mechanism
+    to manually load/process cells if they don't arrive in time.
+    """
+    expected_cells = metadata["rows"].get(row_id, [])
+    num_to_expect = len(expected_cells)
+    if num_to_expect == 0:
+        return []
+
+    # Check buffer first for any cells that have already arrived
+    key = (projection, row_id)
+    gathered_bundles = cell_buffer.pop(key, [])
+
+    last_arrival_time = time.time()
+    while len(gathered_bundles) < num_to_expect:
+        remaining_time = GATHER_TIMEOUT_SECONDS - (time.time() - last_arrival_time)
+        if remaining_time <= 0:
+            logger.warning(f"Timeout waiting for cells for P:{projection} R:{row_id}. Manually loading missing cells.")
+            break  # Exit loop to proceed with manual loading
+
+        try:
+            # Wait for the next cell with a calculated timeout
+            bundle = combined_cell_queue.get(timeout=remaining_time)
+            if bundle is None:
+                logger.warning("Shutdown signal received while gathering cells.")
+                break
+
+            last_arrival_time = time.time()  # Reset timer on successful arrival
+            bundle_key = (bundle["projection"], bundle["row_id"])
+
+            if bundle_key == key:
+                gathered_bundles.append(bundle)
+            else:
+                # It's for a future row/projection, so buffer it
+                cell_buffer.setdefault(bundle_key, []).append(bundle)
+
+        except Empty:
+            logger.warning(f"Timeout hit via queue.get() for P:{projection} R:{row_id}. Manually loading.")
+            break  # Exit loop to proceed with manual loading
+
+    # If, after waiting, cells are still missing, load them manually
+    if len(gathered_bundles) < num_to_expect:
+        received_cell_names = {b["skycell_id"] for b in gathered_bundles}
+        expected_cell_info = {name: x for name, x in expected_cells}
+        missing_cell_names = set(expected_cell_info.keys()) - received_cell_names
+
+        logger.info(f"Identified {len(missing_cell_names)} missing cells for P:{projection} R:{row_id}.")
+        for cell_name in missing_cell_names:
+            try:
+                logger.info(f"Manually loading and processing missing cell: {cell_name}")
+                zarr_store = zarr.open(zarr_path, mode="r")
+                bands_data, masks_data, headers_data = load_skycell_bands_masks_and_headers(zarr_store, projection, cell_name)
+                combined_image, combined_mask = process_skycell_bands(bands_data, masks_data, headers_data)
+
+                manual_bundle = {
+                    "skycell_id": cell_name,
+                    "projection": projection,
+                    "row_id": row_id,
+                    "x_coord": expected_cell_info[cell_name],
+                    "combined_image": combined_image,
+                    "combined_mask": combined_mask,
+                }
+                gathered_bundles.append(manual_bundle)
+            except Exception as e:
+                logger.error(f"Failed to manually load/process {cell_name}: {e}", exc_info=True)
+
+    return gathered_bundles
+
+
+def process_row_step_from_queue(state: ProcessingState, config: MasterArrayConfig, metadata: dict, current_row_id: int, next_row_id: Optional[int], combined_cell_queue: Queue, cell_buffer: dict, psf_sigma: float, zarr_path: str, projection: str) -> tuple[dict, dict]:
+    """
+    Encapsulates the logic for processing a single row step in the sliding window.
+    It loads necessary data, applies padding, performs convolution, and extracts results.
+    """
+    # 1. Load the Current Row (Only If Necessary)
     if state.current_row_id != current_row_id:
-        logger.info(f"Loading current row {current_row_id}")
-        current_cells = rows.get(current_row_id, [])
-        current_positions, current_masks = load_row_into_array_parallel(zarr_path, projection, current_cells, state.current_array, config, metadata, num_loaders=4)
-        state.cell_locations.update(current_positions)
-        state.current_masks.update(current_masks)
+        logger.info(f"Loading initial current row ID {current_row_id}")
+        current_row_bundles = _gather_cells_for_row(projection, current_row_id, metadata, combined_cell_queue, cell_buffer, zarr_path)
+        positions, masks = assemble_row_from_bundles(state.current_array, current_row_bundles, config)
+        state.cell_locations.update(positions)
+        state.current_masks.update(masks)
         state.current_row_id = current_row_id
-        logger.info(f"Current row {current_row_id} loaded with {len(current_positions)} cells")
+        logger.info(f"Built current row ID {current_row_id} with {len(positions)} cells.")
 
-    # Load next row if needed
-    if next_row_id is not None and state.next_row_id != next_row_id:
-        logger.info(f"Loading next row {next_row_id}")
-        next_cells = rows.get(next_row_id, [])
-        next_positions, next_masks = load_row_into_array_parallel(zarr_path, projection, next_cells, state.next_array, config, metadata, num_loaders=4)
-        state.next_masks.update(next_masks)
-        state.next_cell_locations.update(next_positions)  # Store next row cell locations
+    # 2. Load the Next Row (Always)
+    if next_row_id is not None:
+        logger.info(f"Preparing next row ID {next_row_id}")
+        next_row_bundles = _gather_cells_for_row(projection, next_row_id, metadata, combined_cell_queue, cell_buffer, zarr_path)
+        positions, masks = assemble_row_from_bundles(state.next_array, next_row_bundles, config)
+        state.next_cell_locations.update(positions)
+        state.next_masks.update(masks)
         state.next_row_id = next_row_id
-        logger.info(f"Next row {next_row_id} loaded")
+        logger.info(f"Prepared next row ID {next_row_id} with {len(state.next_cell_locations)} cells.")
+    else:
+        # Clear next state if there is no next row
+        state.next_array.fill(np.nan)
+        state.next_cell_locations.clear()
+        state.next_masks.clear()
+        state.next_row_id = None
+        logger.info("No next row to prepare.")
 
-    # Apply cross-row padding
-    logger.info("Applying cross-row padding")
+    # 3. Apply Cross-Row Padding
     apply_cross_row_padding(state, config)
 
-    # # Load cross-projection padding using modern system
-    # logger.info("Loading cross-projection padding")
-    # # Add csv_path to metadata for cross-projection loading
-    # metadata_with_csv = dict(metadata)
-    # metadata_with_csv["csv_path"] = csv_path
-    # from modern_padding import load_modern_cross_projection_padding
+    # 4. Perform Convolution
+    nan_mask = np.isnan(state.current_array)
+    state.current_array[nan_mask] = 0
+    logger.info(f"Applying convolution for row ID {current_row_id}")
+    convolved_array = convolution_utils.apply_gaussian_convolution(state.current_array, sigma=psf_sigma)
+    # Restore NaNs on the result, not the state array which will be replaced
+    convolved_array[nan_mask] = np.nan
 
-    # load_modern_cross_projection_padding(state, config, metadata_with_csv, current_row_id, zarr_path)
+    # 5. Extract and Return Results
+    results_data = extract_cell_results(convolved_array, state.cell_locations)
+    results_masks = {name: mask for name, mask in state.current_masks.items() if name in state.cell_locations}
 
-    # Convolve current array
-    logger.info(f"Starting convolution with sigma={psf_sigma}")
-    nans_loc = np.isnan(state.current_array)
-    state.current_array[nans_loc] = 0  # Replace NaNs with 0 for convolution
-    convolved = apply_gaussian_convolution(state.current_array, sigma=psf_sigma)
-    logger.info("Convolution completed")
-
-    # Extract results for current row cells
-    current_positions = {name: pos for name, pos in state.cell_locations.items() if name in rows.get(current_row_id, [])}
-
-    logger.info(f"Extracting results for {len(current_positions)} cells")
-    results_data = extract_cell_results(convolved, current_positions, config)
-
-    # Extract corresponding masks for the current row
-    current_masks_for_row = {name: mask for name, mask in state.current_masks.items() if name in current_positions}
-
-    logger.info(f"Row {current_row_id} processing complete: {len(results_data)} results extracted")
-
-    return results_data, current_masks_for_row
+    return results_data, results_masks
 
 
-def create_master_array_wcs(metadata: dict, config: MasterArrayConfig, current_row_id: int) -> WCS:
-    """Create WCS object for the master array based on first cell + padding offset."""
-    # Get first cell's WCS information from the dataframe
-    proj_df = metadata["dataframe"]
-    # Filter to the current projection and row
-    proj_df = proj_df[proj_df["projection"].astype(str) == str(metadata["projection"])]
-    proj_df = proj_df[proj_df["y"] == int(current_row_id)]
-    proj_df = proj_df.sort_values(by="x")
-    first_cell = proj_df.iloc[0]
-
-    # Extract WCS parameters; use PC and CDELT instead of CD
-    crval1 = float(first_cell["CRVAL1"])
-    crval2 = float(first_cell["CRVAL2"])
-    crpix1 = float(first_cell["CRPIX1"]) + PAD_SIZE
-    crpix2 = float(first_cell["CRPIX2"]) + PAD_SIZE
-    pc1_1 = float(first_cell["PC1_1"])
-    pc1_2 = float(first_cell["PC1_2"])
-    pc2_1 = float(first_cell["PC2_1"])
-    pc2_2 = float(first_cell["PC2_2"])
-    cdelt1 = float(first_cell["CDELT1"])
-    cdelt2 = float(first_cell["CDELT2"])
-
-    master_wcs = WCS(naxis=2)
-    master_wcs.wcs.crval = [crval1, crval2]
-    master_wcs.wcs.crpix = [crpix1, crpix2]
-    master_wcs.wcs.pc = [[pc1_1, pc1_2], [pc2_1, pc2_2]]
-    master_wcs.wcs.cdelt = [cdelt1, cdelt2]
-    master_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
-    master_wcs.wcs.cunit = ["deg", "deg"]
-
-    return master_wcs
-
-
-def create_cell_wcs(cell_name: str, metadata: dict) -> WCS:
-    """Create WCS object for a specific cell."""
-    proj_df = metadata["dataframe"]
-    cell_row = proj_df[proj_df["NAME"] == cell_name]
-
-    if cell_row.empty:
-        raise ValueError(f"Cell {cell_name} not found in metadata")
-
-    cell_data = cell_row.iloc[0]
-
-    # Extract WCS parameters
-    crval1 = float(cell_data["CRVAL1"])
-    crval2 = float(cell_data["CRVAL2"])
-    crpix1 = float(cell_data["CRPIX1"]) + PAD_SIZE
-    crpix2 = float(cell_data["CRPIX2"]) + PAD_SIZE
-    pc1_1 = float(cell_data["PC1_1"])
-    pc1_2 = float(cell_data["PC1_2"])
-    pc2_1 = float(cell_data["PC2_1"])
-    pc2_2 = float(cell_data["PC2_2"])
-    cdelt1 = float(cell_data["CDELT1"])
-    cdelt2 = float(cell_data["CDELT2"])
-
-    # Create WCS object
-    cell_wcs = WCS(naxis=2)
-    cell_wcs.wcs.crval = [crval1, crval2]
-    cell_wcs.wcs.crpix = [crpix1, crpix2]
-    cell_wcs.wcs.cd = [[pc1_1, pc1_2], [pc2_1, pc2_2]]
-    cell_wcs.wcs.cdelt = [cdelt1, cdelt2]
-    cell_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
-    cell_wcs.wcs.cunit = ["deg", "deg"]
-
-    return cell_wcs
-
-
-def advance_sliding_window(state: ProcessingState) -> None:
-    """Advance the sliding window (next becomes current)."""
-    logger.info(f"Before advance: current_row_id={state.current_row_id}, next_row_id={state.next_row_id}")
-
-    state.current_array, state.next_array = state.next_array, state.current_array
-    state.next_array.fill(0)
-
-    # Advance masks
-    state.current_masks, state.next_masks = state.next_masks, {}
-
-    # Advance row IDs
-    state.current_row_id = state.next_row_id
-    state.next_row_id = None
-
-    # Transfer next cell locations to current and clear next
-    state.cell_locations.clear()
-    state.cell_locations.update(state.next_cell_locations)
-    state.next_cell_locations.clear()
-
-    logger.info(f"After advance: current_row_id={state.current_row_id}, next_row_id={state.next_row_id}")
-
-
-def process_projection_sliding_window(zarr_path: str, csv_path: str, projection: str, output_path: str, psf_sigma: float = 60.0) -> dict:
-    """Process a complete projection using sliding window approach."""
-    logger.info(f"Processing projection {projection} with sliding window")
-
-    # Extract metadata
-    logger.info("Extracting projection metadata")
-    metadata = extract_projection_metadata(csv_path, projection)
-    logger.info("Creating master array configuration")
-    config = create_master_array_config(metadata)
-    logger.info("Initializing processing state")
-    state = initialize_processing_state(config)
-
-    # Identify padding requirements
-    logger.info("Identifying padding requirements")
-    # state.padding_cells = identify_padding_requirements(metadata, csv_path)
-
-    logger.info(f"Projection {projection}: {len(metadata['rows'])} rows, max {config.max_cells} cells/row, cell size {config.cell_width}x{config.cell_height}")
-
-    # Process rows
-    row_ids = sorted(metadata["rows"].keys())
-    logger.info(f"Processing {len(row_ids)} rows: {row_ids}")
-    processed_rows = 0
-    total_cells = 0
-
-    for i, current_row_id in enumerate(row_ids):
+def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell_queue: Queue, results_queue: Queue, psf_sigma: float, zarr_path: str):
+    """
+    SPEC: This is Stage 3. It iterates through projections sequentially,
+    calling a helper function to process each row, queues results, and manages
+    the sliding window state.
+    """
+    for projection in projections:
+        logger.info(f"--- Starting sequential processing for projection: {projection} ---")
+        # Initialize buffer once per projection
+        cell_buffer = {}
         try:
-            logger.info(f"=== Processing row {i + 1}/{len(row_ids)}: row_id={current_row_id} ===")
-
-            # Determine next row
-            next_row_id = row_ids[i + 1] if i + 1 < len(row_ids) else None
-
-            # Process row
-            results_data, results_masks = process_row_sliding_window(zarr_path, metadata, config, state, current_row_id, next_row_id, csv_path, psf_sigma)
-
-            # Save results
-            if results_data:
-                logger.info(f"Saving {len(results_data)} results for row {current_row_id}")
-                from zarr_utils import save_convolved_results
-
-                save_convolved_results(output_path, projection, current_row_id, results_data, results_masks)
-                total_cells += len(results_data)
-                logger.info("Results saved successfully")
-
-            processed_rows += 1
-
-            # Advance window for next iteration (except on last row)
-            if i < len(row_ids) - 1:
-                logger.info("Advancing sliding window")
-                advance_sliding_window(state)
-
-            # Memory cleanup
-            logger.info("Running garbage collection")
-            gc.collect()
-
-            logger.info(f"Row {current_row_id} complete. Progress: {processed_rows}/{len(row_ids)} rows, {total_cells} total cells")
-
+            metadata = extract_projection_metadata(df, projection)
+            config = create_master_array_config(metadata)
+            state = initialize_processing_state(config)
+            row_ids = sorted(metadata["rows"].keys())
         except Exception as e:
-            logger.error(f"Failed to process row {current_row_id}: {e}")
+            logger.error(f"Failed to initialize projection {projection}: {e}. Skipping.")
+            # Attempt to drain the queue of cells for this failed projection
+            num_cells_to_skip = sum(len(cells) for _, cells in metadata.get("rows", {}).items())
+            for _ in range(num_cells_to_skip):
+                try:
+                    combined_cell_queue.get(timeout=1)
+                except Empty:
+                    break
             continue
 
-    logger.info(f"Completed projection {projection}: {processed_rows}/{len(row_ids)} rows, {total_cells} cells")
+        # Inner Loop: Process each row
+        for i, current_row_id in enumerate(row_ids):
+            logger.info(f"--- Processing step for row {i + 1}/{len(row_ids)}: ROW ID {current_row_id} ---")
 
-    return {"projection": projection, "rows_processed": processed_rows, "total_rows": len(row_ids), "cells_processed": total_cells}
+            # Determine Next Row
+            next_row_id = row_ids[i + 1] if i + 1 < len(row_ids) else None
+
+            # Call the Helper Function to do the heavy lifting
+            results_data, results_masks = process_row_step_from_queue(state, config, metadata, current_row_id, next_row_id, combined_cell_queue, cell_buffer, psf_sigma, zarr_path, projection)
+
+            # Queue the Results
+            processed_bundle = {"projection": projection, "row_id": current_row_id, "results_data": results_data, "results_masks": results_masks}
+            results_queue.put(processed_bundle)
+            logger.info(f"Finished processing and queued results for row {current_row_id}")
+
+            # Advance the Window if not the last row
+            if next_row_id is not None:
+                advance_sliding_window(state)
+
+        logger.info(f"--- Finished sequential processing for projection: {projection} ---")
+
+    # Shutdown Signal for the saver
+    results_queue.put(None)
 
 
-def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_root: str = "data", projections_limit: Optional[int] = None) -> dict:
-    """Run the complete modern sliding window pipeline."""
-    logger.info(f"Starting modern sliding window pipeline for sector {sector}, camera {camera}, ccd {ccd}")
+# --- Main Orchestrator ---
 
-    # Set up paths
+
+def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_root: str = "data", projections_limit: Optional[int] = None, psf_sigma: float = 60.0):
+    """The top-level master orchestrator for the entire pipeline."""
+    global _child_processes
+    _child_processes.clear()
+    signal.signal(signal.SIGINT, shutdown_handler)
+
+    logger.info(f"Starting pipeline for sector {sector}, camera {camera}, ccd {ccd}")
     zarr_path = f"{data_root}/ps1_skycells_zarr/ps1_skycells.zarr"
     output_path = f"{data_root}/convolved_results/sector_{sector:04d}_camera_{camera}_ccd_{ccd}.zarr"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     try:
-        from csv_utils import find_csv_file, get_projections_from_csv
-
         csv_path = find_csv_file(data_root, sector, camera, ccd)
         projections = get_projections_from_csv(csv_path)
-
         if projections_limit:
             projections = projections[:projections_limit]
-
+        df = load_csv_data(csv_path)
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         return {"error": str(e)}
 
-    # Process each projection
-    results = []
-    for i, projection in enumerate(projections):
-        logger.info(f"Progress: {i + 1}/{len(projections)} projections")
+    # --- Setup ---
+    zarr_store = zarr.open(zarr_path, mode="r")
+    num_pre_processors = 50
+    num_readers = 2
 
-        try:
-            result = process_projection_sliding_window(zarr_path, csv_path, projection, output_path, psf_sigma=60.0)
-            results.append(result)
+    task_queue = Queue()
+    raw_cell_queue = Queue(maxsize=20)
+    combined_cell_queue = Queue(maxsize=30)
+    results_queue = Queue(maxsize=3)
 
-        except Exception as e:
-            logger.error(f"Failed to process projection {projection}: {e}")
-            continue
+    # --- Start Persistent Workers (Stages 1, 2, 4) ---
+    saver_proc = Process(target=saver_worker, args=(results_queue, output_path))
+    saver_proc.start()
 
-    # Summary
-    total_rows = sum(r["rows_processed"] for r in results)
-    total_cells = sum(r["cells_processed"] for r in results)
+    with ThreadPoolExecutor(max_workers=num_pre_processors) as pre_proc_executor, ThreadPoolExecutor(max_workers=num_readers) as reader_executor:
+        for _ in range(num_pre_processors):
+            pre_proc_executor.submit(pre_processor_worker, raw_cell_queue, combined_cell_queue)
 
-    logger.info("Modern sliding window pipeline completed!")
-    logger.info(f"  Processed {len(results)}/{len(projections)} projections")
-    logger.info(f"  Total rows: {total_rows}")
-    logger.info(f"  Total cells: {total_cells}")
+        # Start Stage 1 workers
+        for _ in range(num_readers):
+            reader_executor.submit(reader_worker, task_queue, raw_cell_queue, zarr_store)
 
-    return {"sector": sector, "camera": camera, "ccd": ccd, "projections_processed": len(results), "total_projections": len(projections), "total_rows": total_rows, "total_cells": total_cells, "results": results}
+        # --- Dispatch All Tasks ---
+        logger.info(f"Dispatching tasks for {len(projections)} projections.")
+        master_task_list = []
+        for projection in projections:
+            try:
+                metadata = extract_projection_metadata(df, projection)
+                for row_id, cells in sorted(metadata["rows"].items()):
+                    for cell_name, x_coord in cells:
+                        master_task_list.append((cell_name, projection, row_id, x_coord))
+            except Exception as e:
+                logger.error(f"Failed to create tasks for projection {projection}: {e}")
+
+        for task in master_task_list:
+            task_queue.put(task)
+        logger.info("All tasks have been dispatched to the reader workers.")
+
+        # --- Signal Reader Shutdown ---
+        for _ in range(num_readers):
+            task_queue.put(None)
+
+        # --- Run Sequential Processor (Stage 3) in Main Thread ---
+        sequential_processor(projections, df, combined_cell_queue, results_queue, psf_sigma, zarr_path)
+
+        # --- Final Shutdown Sequence ---
+        logger.info("Sequential processor finished. Shutting down upstream workers.")
+        for _ in range(num_pre_processors):
+            raw_cell_queue.put(None)
+
+    saver_proc.join()
+    logger.info("Pipeline completed successfully!")
+    return {"status": "success"}
+
+
+def shutdown_handler(signum, frame):
+    """
+    Handles SIGINT (Ctrl+C) to ensure all child processes are terminated.
+    """
+    logger.warning("Ctrl+C detected! Initiating graceful shutdown...")
+    for p in _child_processes:
+        if p.is_alive():
+            logger.info(f"Terminating process: {p.name} (PID: {p.pid})")
+            p.terminate()
+            p.join()
+    logger.info("All child processes terminated. Exiting.")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
     import argparse
 
-    # Set up logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
     parser = argparse.ArgumentParser(description="Modern Sliding Window PS1 Processing Pipeline")
     parser.add_argument("sector", type=int, help="TESS sector number")
     parser.add_argument("camera", type=int, help="TESS camera number")
     parser.add_argument("ccd", type=int, help="TESS CCD number")
     parser.add_argument("--data-root", default="data", help="Root data directory")
     parser.add_argument("--limit", type=int, help="Limit projections for testing")
-    parser.add_argument("--psf-sigma", type=float, default=60.0, help="PSF sigma for convolution")
-
+    parser.add_argument("--psf-sigma", type=float, default=40.0, help="PSF sigma for convolution")
     args = parser.parse_args()
+    results = run_modern_sliding_window_pipeline(args.sector, args.camera, args.ccd, data_root=args.data_root, projections_limit=args.limit, psf_sigma=args.psf_sigma)
 
-    results = run_modern_sliding_window_pipeline(args.sector, args.camera, args.ccd, data_root=args.data_root, projections_limit=args.limit)
-
-    if "error" not in results:
+    if results.get("status") == "success":
         print("\n✅ Modern sliding window pipeline completed successfully!")
-        print(f"Processed {results['projections_processed']} projections")
-        print(f"Total cells processed: {results['total_cells']}")
     else:
-        print(f"\n❌ Pipeline failed: {results['error']}")
-        exit(1)
+        print(f"\n❌ Pipeline failed: {results.get('error', 'Unknown error')}")

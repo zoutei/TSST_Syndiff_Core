@@ -6,7 +6,6 @@ import logging
 
 import dask.array as da
 import numpy as np
-from dask.diagnostics import ProgressBar
 from dask_image.ndfilters import gaussian_filter as dask_gaussian_filter
 
 logger = logging.getLogger(__name__)
@@ -25,7 +24,7 @@ def apply_gaussian_convolution(image: np.ndarray, sigma: float = 60.0, radius: i
     """
     truncate = radius / sigma
     dimage = da.from_array(image, chunks=(1024, 1024))
-    with ProgressBar():
-        convolved = dask_gaussian_filter(dimage, sigma=sigma, mode="constant", cval=np.nan, truncate=truncate).compute()
+    # with ProgressBar():
+    convolved = dask_gaussian_filter(dimage, sigma=sigma, mode="constant", cval=np.nan, truncate=truncate).compute()
     logger.debug(f"Applied Gaussian convolution (sigma={sigma}): {image.shape}")
     return convolved

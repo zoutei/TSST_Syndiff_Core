@@ -151,7 +151,7 @@ def extract_to_fits(zarr_path: Path, skycell: str, is_mask: bool, output_path: O
 def main():
     parser = argparse.ArgumentParser(description="Extract FITS from flat-layout convolved/combined Zarr stores")
 
-    # positional form: python script.py 20 3 3 2556.080
+    # positional form: python zarr_to_convolved_fits.py 20 3 3 2556.080
     parser.add_argument("sector", nargs="?", type=int, default=20, help="Sector number (default: 20)")
     parser.add_argument("camera", nargs="?", type=int, default=3, help="Camera id (default: 3)")
     parser.add_argument("ccd", nargs="?", type=int, default=3, help="CCD id (default: 3)")
