@@ -7,7 +7,7 @@ Modernized and canonical implementation for combining PS1 images, analyzing TESS
 Run the pipeline by specifying sector and CCD. All paths are auto-derived.
 
 ```bash
-python run_combine.py --sector 20 --ccd-id 11 -v
+python pipeline.py --sector 20 --ccd-id 11 -v
 ```
 
 This resolves the following default paths (override with flags if needed):
