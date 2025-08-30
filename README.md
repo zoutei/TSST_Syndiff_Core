@@ -1,48 +1,211 @@
-# PS1 Image Processing Pipeline
+# Syndiff Pipeline
 
-Modernized and canonical implementation for combining PS1 images, analyzing TESS pixel mappings, applying smart padding, and producing final convolved outputs.
+Complete end-to-end pipeline for creating TESS Full Frame Image Template with PanSTARRS1 (PS1) data. The pipeline automatically extracts sector, camera, and CCD information from the TESS FITS file and runs the full processing workflow.
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Pipeline Steps](#pipeline-steps)
+- [Command Line Options](#command-line-options)
+- [Output Structure](#output-structure)
+- [Examples](#examples)
+- [Running Individual Pipeline Components](#running-individual-pipeline-components)
+- [Notes](#notes)
 
 ## Quick Start
 
-Run the pipeline by specifying sector and CCD. All paths are auto-derived.
+Simply provide the TESS FITS file - the pipeline will automatically determine sector, camera, and CCD, and use the default skycell catalog:
 
 ```bash
-python pipeline.py --sector 20 --ccd-id 11 -v
+# Basic usage with default skycell catalog (data/SkyCells/skycell_wcs.csv)
+python pipeline.py /path/to/tess-ffi.fits
+
+# With custom skycell catalog
+python pipeline.py /path/to/tess-ffi.fits /path/to/custom-catalog.csv
+
+# With verbose output
+python pipeline.py /path/to/tess-ffi.fits -v
+
+# Override data directory and processing parameters
+python pipeline.py /path/to/tess-ffi.fits \
+    --data-root /custom/data/path \
+    --cores 16 \
+    --jobs 100 \
+    --overwrite
 ```
 
-This resolves the following default paths (override with flags if needed):
-- `datapath`: `data/ps1_skycells`
-- `mapping_path`: `data/mapping_output/sector_0020/ccd_11`
-- `skycells_path`: `data/mapping_output/sector_0020/ccd_11/tess_s0020_11_master_skycells_list.csv`
-- `catalog_path`: `data/Sector_20_star_cat`
-- `savepath`: `data/tess_comb_skycells/s0020_ccd11`
+## Pipeline Steps
 
-## What it does
-- Loads PS1 r, i, z, y bands and linearly combines them
-- Saves the combined image
-- Analyzes TESS pixel mapping to determine where padding is needed
-- Applies smart padding via skycell reprojection only where needed
-- Convolves with a Gaussian PSF and writes final science image and mask
+The pipeline automatically runs four main steps:
 
-## Configuration
+1. **Pancakes v2** - Generate TESS↔PS1 mapping files and skycell list
+2. **Download** - Download PS1 skycells and store in efficient Zarr format  
+3. **Process PS1** - Combine PS1 bands using modern sliding window pipeline
+4. **Downsample** - Multi-offset downsample to TESS grid
 
-In-code configuration is defined by `process_ps1.ProcessingConfig`. Prefer setting `sector` and `ccd_id`, which derive all other paths. You can override any path explicitly.
+## Command Line Options
 
-Key options:
-- `sector` (int), `ccd_id` (int): Primary inputs
-- `data_root` (str): Root directory for data (default `data`)
-- `combine_weights` (list[float]): Linear combination weights for r, i, z, y
-- `pad_distance` (int): Edge distance for padding decision
-- `psf_std` (float): Gaussian PSF sigma for convolution
-- `cores` (int), `overwrite` (bool), `verbose` (int)
+### Required Arguments
 
-## Outputs
-Inside `savepath`:
-- `combined/` — pre-convolution combined images
-- `final_conv/` — convolved images and masks
+- `tess_fits` - Path to TESS FFI FITS file (sector/camera/CCD auto-extracted)
+
+### Optional Arguments
+
+- `skycell_wcs_csv` - Path to skycell WCS catalog CSV for Pancakes (default: `data/SkyCells/skycell_wcs.csv`)
+- `--data-root` - Root directory for data storage (default: `data`)
+- `--cores` - Number of CPU cores to use (default: 8)
+- `--jobs` - Number of parallel download jobs (default: 60)
+- `--overwrite` - Overwrite existing files
+- `--verbose` - Increase verbosity (`-v` for INFO, `-vv` for DEBUG)
+- `--multi-offset-array` - Comma-separated dx,dy pairs for downsampling (default: `0.0,0.0`)
+- `--ignore-mask-bits` - Comma-separated mask bits to ignore (default: `12`)
+
+## Output Structure
+
+The pipeline creates the following directory structure under `data_root`:
+
+```
+data/
+├── mapping_output/
+│   └── sector_XXXX/
+│       └── camera_X/
+│           └── ccd_X/
+│               ├── tess_sXXXX_X_X_master_skycells_list.csv
+│               └── TESS_sXXXX_X_X_skycell.*.fits.gz
+├── ps1_skycells_zarr/
+│   └── sector_XXXX_camera_X_ccd_X.zarr/
+└── convolved_results/
+    └── sector_XXXX/
+        └── camera_X/
+            └── ccd_X/
+                ├── convolved_images.zarr
+                └── cell_metadata.json
+```
+
+## Examples
+
+### Process a single TESS image with default settings
+
+```bash
+python pipeline.py tess2020123456-s0020-1-3-0000-s_ffic.fits
+```
+
+### High-performance processing
+
+```bash
+python pipeline.py tess2020123456-s0020-1-3-0000-s_ffic.fits \
+    --cores 32 \
+    --jobs 200 \
+    --verbose
+```
+
+### Multi-offset downsampling
+
+```bash
+python pipeline.py tess2020123456-s0020-1-3-0000-s_ffic.fits \
+    --multi-offset-array "0.0,0.0,0.5,0.0,0.0,0.5,0.5,0.5"
+```
+
+### Using custom skycell catalog
+
+```bash
+python pipeline.py tess2020123456-s0020-1-3-0000-s_ffic.fits /path/to/custom-catalog.csv
+```
+
+## Running Individual Pipeline Components
+
+While the main pipeline runs all steps automatically, you can also run individual components for debugging, development, or partial processing:
+
+### 1. Pancakes v2 - TESS↔PS1 Mapping
+
+Generate TESS to PS1 skycell mappings and create the master skycells list.
+
+```bash
+python pancakes_v2.py /path/to/tess-ffi.fits
+```
+
+**Key Options:**
+- `--skycell_wcs_csv` - Path to skycell WCS catalog (default: `./data/SkyCells/skycell_wcs.csv`)
+- `--output_path` - Output directory for mapping files (default: `./data/skycell_pixel_mapping`)
+- `--max_workers` - Number of parallel workers for processing
+- `--overwrite` - Overwrite existing output files
+
+📖 **More Info:** See [`README_pancakes.md`](README_pancakes.md) for detailed documentation.
+
+### 2. Download PS1 Data
+
+Download PS1 skycell data and store in efficient Zarr format.
+
+```bash
+python download_and_store_zarr.py 20 3 3
+```
+
+**Required Arguments:**
+- `sector` - TESS sector number
+- `camera` - TESS camera number (1-4)
+- `ccd` - TESS CCD number (1-4)
+
+**Key Options:**
+- `--num-workers` - Number of parallel download workers (default: 32)
+- `--zarr-output-dir` - Directory for Zarr output (default: `data/ps1_skycells_zarr`)
+- `--use-local-files` - Use locally saved FITS files instead of downloading
+- `--overwrite` - Overwrite existing Zarr arrays
+
+### 3. Process PS1 - Modern Sliding Window Pipeline
+
+Combine PS1 bands and convolve using the modern sliding window approach.
+
+```bash
+python process_ps1.py 20 3 3
+```
+
+**Required Arguments:**
+- `sector` - TESS sector number
+- `camera` - TESS camera number (1-4)
+- `ccd` - TESS CCD number (1-4)
+
+**Key Options:**
+- `--data-root` - Root data directory (default: `data`)
+- `--limit` - Limit number of projections for testing
+- `--psf-sigma` - PSF sigma for convolution (default: 40.0)
+
+📖 **More Info:** See [`README_process_ps1.md`](README_process_ps1.md) for comprehensive documentation of the sliding window architecture.
+
+### 4. Multi-Offset Downsampling
+
+Generate multiple downsampled images with different pixel offsets.
+
+```bash
+python multi_offset_downsampling.py 20 3 3
+```
+
+**Optional Arguments:**
+- `sector` - TESS sector number (default: 20)
+- `camera` - Camera number (default: 3)
+- `ccd` - CCD number (default: 3)
+
+**Key Options:**
+- `--data-root` - Root data directory
+- `--convolved-dir` - Convolved results directory override
+- `--output-base` - Base output directory override
+
+### Component Dependencies
+
+The pipeline components have the following dependencies:
+
+```
+Pancakes v2 → Download PS1 → Process PS1 → Multi-Offset Downsampling
+```
+
+Each step uses outputs from the previous step, so they must be run in order when using individual components.
 
 ## Notes
-- Saturation correction hooks are in place but currently disabled by default.
-- Legacy code remains under `old/` for reference; the upgraded variants have been consolidated and renamed as the main implementation.
+
+- **Automatic Metadata Extraction**: Sector, camera, and CCD are automatically extracted from the TESS FITS filename and header
+- **Default Skycell Catalog**: The pipeline uses `data/SkyCells/skycell_wcs.csv` by default - ensure this file exists or provide a custom catalog
+- **Resumable Processing**: Each step checks for existing outputs and can resume if interrupted
+- **Memory Efficient**: Uses Zarr format for efficient storage and streaming processing
+- **Parallel Processing**: Optimized for multi-core systems with configurable parallelism
+- **Error Handling**: Comprehensive error checking and informative logging
 
 
