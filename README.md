@@ -4,6 +4,7 @@ Complete end-to-end pipeline for creating TESS Full Frame Image Template with Pa
 
 ## Table of Contents
 
+- [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Pipeline Steps](#pipeline-steps)
 - [Command Line Options](#command-line-options)
@@ -11,6 +12,71 @@ Complete end-to-end pipeline for creating TESS Full Frame Image Template with Pa
 - [Examples](#examples)
 - [Running Individual Pipeline Components](#running-individual-pipeline-components)
 - [Notes](#notes)
+
+## Requirements
+
+### System Requirements
+
+- **Python**: 3.8 or higher
+- **Memory**: 128GB+ recommended
+- **Storage**: 1TB+ free space for PS1 data downloads
+- **CPU**: Multi-core processor
+
+### Python Dependencies
+
+Install the required packages using pip:
+
+```bash
+pip install numpy astropy pandas zarr sep scipy dask dask-image numba shapely tqdm filelock
+```
+
+#### Core Dependencies
+
+- **numpy**: Array operations and mathematical functions
+- **astropy**: FITS file handling, WCS operations, and astronomical coordinate transformations
+- **pandas**: Data manipulation and CSV file handling
+- **zarr**: Efficient array storage and retrieval for large datasets
+- **sep**: Source Extractor Python for astronomical object detection and background removal
+- **scipy**: Signal processing and convolution operations
+- **dask**: Parallel computing and distributed processing
+- **dask-image**: Image processing with Dask arrays
+- **numba**: JIT compilation for performance-critical functions
+- **shapely**: Geometric operations for sky cell processing
+- **tqdm**: Progress bars for long-running operations
+- **filelock**: Thread-safe file operations
+
+### Special Dependencies
+
+#### Custom MOCPy Installation
+
+The pipeline uses a custom modified version of MOCPy with enhanced performance for astronomical region processing:
+
+```bash
+./install_mocpy.sh
+```
+
+#### Alternative Installation Method
+
+1. **Install Rust** (required for building):
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rust-lang.org | sh
+   source ~/.cargo/env
+   ```
+
+2. **Install maturin** (Python-Rust build tool):
+
+   ```bash
+   pip install maturin
+   ```
+
+3. **Build and install custom MOCPy**:
+
+   ```bash
+   cd mocpy_syndiff
+   maturin develop --release
+   cd ..
+   ```
 
 ## Quick Start
 
@@ -64,7 +130,7 @@ The pipeline automatically runs four main steps:
 
 The pipeline creates the following directory structure under `data_root`:
 
-```
+```bash
 data/
 ├── mapping_output/
 │   └── sector_XXXX/
@@ -125,6 +191,7 @@ python pancakes_v2.py /path/to/tess-ffi.fits
 ```
 
 **Key Options:**
+
 - `--skycell_wcs_csv` - Path to skycell WCS catalog (default: `./data/SkyCells/skycell_wcs.csv`)
 - `--output_path` - Output directory for mapping files (default: `./data/skycell_pixel_mapping`)
 - `--max_workers` - Number of parallel workers for processing
@@ -141,11 +208,13 @@ python download_and_store_zarr.py 20 3 3
 ```
 
 **Required Arguments:**
+
 - `sector` - TESS sector number
 - `camera` - TESS camera number (1-4)
 - `ccd` - TESS CCD number (1-4)
 
 **Key Options:**
+
 - `--num-workers` - Number of parallel download workers (default: 32)
 - `--zarr-output-dir` - Directory for Zarr output (default: `data/ps1_skycells_zarr`)
 - `--use-local-files` - Use locally saved FITS files instead of downloading
@@ -160,11 +229,13 @@ python process_ps1.py 20 3 3
 ```
 
 **Required Arguments:**
+
 - `sector` - TESS sector number
 - `camera` - TESS camera number (1-4)
 - `ccd` - TESS CCD number (1-4)
 
 **Key Options:**
+
 - `--data-root` - Root data directory (default: `data`)
 - `--limit` - Limit number of projections for testing
 - `--psf-sigma` - PSF sigma for convolution (default: 40.0)
@@ -180,11 +251,13 @@ python multi_offset_downsampling.py 20 3 3
 ```
 
 **Optional Arguments:**
+
 - `sector` - TESS sector number (default: 20)
 - `camera` - Camera number (default: 3)
 - `ccd` - CCD number (default: 3)
 
 **Key Options:**
+
 - `--data-root` - Root data directory
 - `--convolved-dir` - Convolved results directory override
 - `--output-base` - Base output directory override
@@ -193,7 +266,7 @@ python multi_offset_downsampling.py 20 3 3
 
 The pipeline components have the following dependencies:
 
-```
+```mermaid
 Pancakes v2 → Download PS1 → Process PS1 → Multi-Offset Downsampling
 ```
 
@@ -207,5 +280,3 @@ Each step uses outputs from the previous step, so they must be run in order when
 - **Memory Efficient**: Uses Zarr format for efficient storage and streaming processing
 - **Parallel Processing**: Optimized for multi-core systems with configurable parallelism
 - **Error Handling**: Comprehensive error checking and informative logging
-
-

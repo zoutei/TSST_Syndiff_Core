@@ -64,6 +64,7 @@ Adjacent PS1 skycells naturally overlap by 480 pixels. The pipeline:
 **Output**: Raw cell bundles with data and metadata
 
 **Key Operations**:
+
 - Loads image and mask data from Zarr store
 - Extracts WCS information and headers
 - Packages data for downstream processing
@@ -75,18 +76,28 @@ Adjacent PS1 skycells naturally overlap by 480 pixels. The pipeline:
 
 **Function**: `pre_processor_worker(raw_cell_queue, combined_cell_queue)`
 
-**Purpose**: Combine PS1 bands and prepare data for assembly
+**Purpose**: Combine PS1 bands, apply background removal, and prepare data for assembly
 
 **Input**: Raw cell bundles from reader workers
 
 **Output**: Combined cell bundles ready for assembly
 
 **Key Operations**:
+
 - Band combination using `process_skycell_bands()` from `band_utils.py`
+- **Background removal using Source Extractor (SEP)**: Identifies and masks astronomical objects
 - Applies band weights and processing
 - Preserves all metadata and spatial information
 
 **Parallelization**: Multiple pre-processor workers run in parallel
+
+#### Background Removal Technique
+
+The pipeline uses **Source Extractor Python (SEP)** for astronomical object detection. Pixels with no detected objects are set to zero.
+
+**Parameters**:
+
+- Detection threshold: Optimized for PS1 data characteristics
 
 ### Stage 3: Sequential Assembler
 
@@ -99,6 +110,7 @@ Adjacent PS1 skycells naturally overlap by 480 pixels. The pipeline:
 **Output**: Convolved results for each row
 
 **Key Operations**:
+
 1. **Row Assembly**: Gathers all cells for a row from the queue
 2. **Sliding Window Management**: Maintains current and next arrays
 3. **Cross-Row Padding**: Uses next row cells to pad current row where possible
@@ -119,6 +131,7 @@ Adjacent PS1 skycells naturally overlap by 480 pixels. The pipeline:
 **Output**: Zarr files and metadata on disk
 
 **Key Operations**:
+
 - Writes image and mask data to Zarr store
 - Saves cell metadata as JSON
 - Handles file locking for thread safety
@@ -169,7 +182,7 @@ class ProcessingState:
 
 ### File Organization
 
-```
+```bash
 data/
 └── convolved_results/
     └── sector_XXXX/
@@ -258,6 +271,7 @@ run_modern_sliding_window_pipeline(
 ## Dependencies
 
 ### Core Libraries
+
 - **numpy**: Array operations and mathematical functions
 - **pandas**: CSV data handling and manipulation
 - **zarr**: Efficient array storage and retrieval
@@ -265,6 +279,7 @@ run_modern_sliding_window_pipeline(
 - **scipy**: Convolution and signal processing
 
 ### Internal Modules
+
 - **band_utils**: PS1 band combination and processing
 - **csv_utils**: CSV file reading and parsing utilities
 - **zarr_utils**: Zarr data loading and management
@@ -273,11 +288,13 @@ run_modern_sliding_window_pipeline(
 ## Monitoring and Logging
 
 ### Progress Tracking
+
 - Row-by-row processing progress
 - Worker queue status monitoring  
 - Memory usage tracking
 
 ### Error Reporting
+
 - Failed cell loading notifications
 - Timeout and queue overflow warnings
 - Processing statistics and timing
