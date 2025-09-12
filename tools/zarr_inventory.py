@@ -88,7 +88,7 @@ def check_array_health(array: zarr.Array) -> dict[str, Any]:
 
 def analyze_skycell_group(group: zarr.Group, skycell_name: str, projection_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Analyze a single skycell group."""
-    expected_arrays = ["r", "r_mask", "i", "i_mask", "z", "z_mask", "y", "y_mask"]
+    expected_arrays = ["r", "r_mask", "r_wt", "i", "i_mask", "i_wt", "z", "z_mask", "z_wt", "y", "y_mask", "y_wt"]
 
     # Get basic info
     skycell_info = get_skycell_info_from_name(skycell_name)
@@ -103,7 +103,9 @@ def analyze_skycell_group(group: zarr.Group, skycell_name: str, projection_id: s
     missing_arrays = set(expected_arrays) - set(regular_arrays)
     extra_arrays = set(regular_arrays) - set(expected_arrays)
 
-    skycell_info.update({"is_complete": len(missing_arrays) == 0, "arrays_present": regular_arrays, "arrays_missing": list(missing_arrays), "arrays_extra": list(extra_arrays), "temp_arrays": temp_arrays, "arrays_present_count": len(regular_arrays), "arrays_missing_count": len(missing_arrays), "temp_arrays_count": len(temp_arrays)})
+    skycell_info.update(
+        {"is_complete": len(missing_arrays) == 0, "arrays_present": regular_arrays, "arrays_missing": list(missing_arrays), "arrays_extra": list(extra_arrays), "temp_arrays": temp_arrays, "arrays_present_count": len(regular_arrays), "arrays_missing_count": len(missing_arrays), "temp_arrays_count": len(temp_arrays)}
+    )
 
     # Check each array's health
     array_details = []
@@ -159,7 +161,18 @@ def analyze_skycell_group(group: zarr.Group, skycell_name: str, projection_id: s
     if extra_arrays:
         corruption_types.append(f"Extra arrays: {list(extra_arrays)}")
 
-    skycell_info.update({"is_corrupted": is_corrupted, "corruption_type": "; ".join(corruption_types) if corruption_types else None, "arrays_corrupted": corrupted_arrays, "arrays_corrupted_count": len(corrupted_arrays), "total_size_bytes": total_size_bytes, "total_size_mb": total_size_bytes / (1024 * 1024), "has_header": has_header, "header_size": header_size})
+    skycell_info.update(
+        {
+            "is_corrupted": is_corrupted,
+            "corruption_type": "; ".join(corruption_types) if corruption_types else None,
+            "arrays_corrupted": corrupted_arrays,
+            "arrays_corrupted_count": len(corrupted_arrays),
+            "total_size_bytes": total_size_bytes,
+            "total_size_mb": total_size_bytes / (1024 * 1024),
+            "has_header": has_header,
+            "header_size": header_size,
+        }
+    )
 
     return skycell_info, array_details
 
@@ -208,7 +221,18 @@ def inventory_zarr_store(zarr_path: Path) -> tuple[list[dict], list[dict]]:
                     except Exception as e:
                         logging.error(f"Error processing skycell {skycell_name}: {e}")
                         # Add error entry
-                        error_summary = {"skycell_name": skycell_name, "projection_id": projection_id, "is_complete": False, "is_corrupted": True, "corruption_type": f"Processing error: {str(e)}", "arrays_present_count": 0, "arrays_missing_count": 8, "arrays_corrupted_count": 0, "temp_arrays_count": 0, "total_size_mb": 0}
+                        error_summary = {
+                            "skycell_name": skycell_name,
+                            "projection_id": projection_id,
+                            "is_complete": False,
+                            "is_corrupted": True,
+                            "corruption_type": f"Processing error: {str(e)}",
+                            "arrays_present_count": 0,
+                            "arrays_missing_count": 12,
+                            "arrays_corrupted_count": 0,
+                            "temp_arrays_count": 0,
+                            "total_size_mb": 0,
+                        }
                         skycell_summaries.append(error_summary)
 
                 logging.info(f"Completed projection {projection_id}: {skycell_count} skycells")
@@ -235,7 +259,7 @@ def inventory_zarr_store(zarr_path: Path) -> tuple[list[dict], list[dict]]:
                 except Exception as e:
                     logging.error(f"Error processing skycell {skycell_name}: {e}")
                     # Add error entry
-                    error_summary = {"skycell_name": skycell_name, "projection_id": projection_id, "is_complete": False, "is_corrupted": True, "corruption_type": f"Processing error: {str(e)}", "arrays_present_count": 0, "arrays_missing_count": 8, "arrays_corrupted_count": 0, "temp_arrays_count": 0, "total_size_mb": 0}
+                    error_summary = {"skycell_name": skycell_name, "projection_id": projection_id, "is_complete": False, "is_corrupted": True, "corruption_type": f"Processing error: {str(e)}", "arrays_present_count": 0, "arrays_missing_count": 12, "arrays_corrupted_count": 0, "temp_arrays_count": 0, "total_size_mb": 0}
                     skycell_summaries.append(error_summary)
 
             logging.info(f"Completed projection {projection_id}: {skycell_count} skycells")

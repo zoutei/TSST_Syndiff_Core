@@ -6,14 +6,19 @@ efficient pipeline. It downloads skycell FITS files, decompresses them in
 memory, and writes the data directly to a single Zarr store.
 
 Key Features:
-- Parallel Downloads: Uses Dask for distributed processing of skycells.
+- Parallel Downloads: Uses Dask for distributed proce    # Download and process the band data
+    result = download_and_process_band(skycell_name_parts, band, data_type, use_local_files, local_data_path)
+    if result:
+        # Store data in zarr
+        store_data_in_zarr(root=root, projection_id=projection_id, skycell_name=skycell_name, band=band, data=result["data"], header=result["header"], array_name=array_name, lock_file=lock_file)
+        return Trueof skycells.
 - Direct-to-Zarr: Avoids saving intermediate FITS files to disk, reducing
   I/O and speeding up the process significantly.
 - Single Zarr Store: Organizes all data into one Zarr store for easier management
   and querying.
 - Thread-Safe Writing: Uses filelock for thread-safe operations.
 - Efficient Organization: Data is organized by projection, skycell, band, and type
-  in a hierarchical structure.
+  (image, mask, weight) in a hierarchical structure.
 - Resumable: The script is idempotent. If stopped, it can be restarted and
   will skip any skycells that have already been downloaded and stored.
 - Local Files Support: Can use locally saved FITS files instead of downloading
@@ -122,14 +127,14 @@ def get_projection_from_name(skycell_name: str) -> Optional[str]:
         return None
 
 
-def load_local_fits_file(skycell_name_parts: list, band: str, is_mask: bool, local_data_path: Path) -> Optional[dict[str, Any]]:
+def load_local_fits_file(skycell_name_parts: list, band: str, data_type: str, local_data_path: Path) -> Optional[dict[str, Any]]:
     """
     Load a FITS file from local storage if it exists.
 
     Args:
         skycell_name_parts: List of skycell name components
         band: Band name (r, i, z, y)
-        is_mask: Whether this is a mask file
+        data_type: Type of data ("image", "mask", "weight")
         local_data_path: Base path to local PS1 data
 
     Returns:
@@ -139,8 +144,10 @@ def load_local_fits_file(skycell_name_parts: list, band: str, is_mask: bool, loc
 
     # Construct local file path
     filename = f"rings.v3.skycell.{projection}.{cell}.stk.{band}.unconv.fits"
-    if is_mask:
+    if data_type == "mask":
         filename = filename.replace(".fits", ".mask.fits")
+    elif data_type == "weight":
+        filename = filename.replace(".fits", ".wt.fits")
 
     local_file_path = local_data_path / projection / cell / filename
 
@@ -152,7 +159,10 @@ def load_local_fits_file(skycell_name_parts: list, band: str, is_mask: bool, loc
         logging.info(f"Loading local file: {local_file_path}")
         with fits.open(local_file_path) as hdul:
             hdu = hdul[1] if len(hdul) > 1 else hdul[0]
-            data = hdu.data.astype(np.float32) if not is_mask else hdu.data.astype(np.uint32)
+            if data_type == "mask":
+                data = hdu.data.astype(np.uint16)
+            else:  # image or weight
+                data = hdu.data.astype(np.float32)
             header = hdu.header.tostring()
             return {"data": data, "header": header}
 
@@ -161,7 +171,7 @@ def load_local_fits_file(skycell_name_parts: list, band: str, is_mask: bool, loc
         return None
 
 
-def download_and_process_band(skycell_name_parts: list, band: str, is_mask: bool, use_local_files: bool = False, local_data_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
+def download_and_process_band(skycell_name_parts: list, band: str, data_type: str, use_local_files: bool = False, local_data_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
     """
     Downloads a single FITS file (.fz) and processes it directly in memory,
     avoiding temporary disk I/O operations for better performance.
@@ -170,17 +180,19 @@ def download_and_process_band(skycell_name_parts: list, band: str, is_mask: bool
     """
     # Try to load from local files first if enabled
     if use_local_files and local_data_path:
-        local_result = load_local_fits_file(skycell_name_parts, band, is_mask, local_data_path)
+        local_result = load_local_fits_file(skycell_name_parts, band, data_type, local_data_path)
         if local_result is not None:
             return local_result
         # If local file not found, fall back to downloading
-        logging.info(f"Local file not found for {skycell_name_parts[1]}.{skycell_name_parts[2]} {band}{'_mask' if is_mask else ''}, downloading...")
+        logging.info(f"Local file not found for {skycell_name_parts[1]}.{skycell_name_parts[2]} {band}_{data_type}, downloading...")
 
     projection, cell = skycell_name_parts[1], skycell_name_parts[2]
 
     file_path_in_repo = f"{projection}/{cell}/rings.v3.skycell.{projection}.{cell}.stk.{band}.unconv.fits"
-    if is_mask:
+    if data_type == "mask":
         file_path_in_repo = file_path_in_repo.replace(".fits", ".mask.fits")
+    elif data_type == "weight":
+        file_path_in_repo = file_path_in_repo.replace(".fits", ".wt.fits")
 
     url = f"http://ps1images.stsci.edu/rings.v3.skycell/{file_path_in_repo}"
 
@@ -195,7 +207,10 @@ def download_and_process_band(skycell_name_parts: list, band: str, is_mask: bool
             # First try direct in-memory decompression with astropy
             with fits.open(io.BytesIO(response.content)) as hdul:
                 hdu = hdul[1] if len(hdul) > 1 else hdul[0]
-                data = hdu.data.astype(np.float32) if not is_mask else hdu.data.astype(np.uint32)
+                if data_type == "mask":
+                    data = hdu.data.astype(np.uint16)
+                else:  # image or weight
+                    data = hdu.data.astype(np.float32)
                 header = hdu.header.tostring()
                 return {"data": data, "header": header}
         except Exception as fits_error:
@@ -217,7 +232,10 @@ def download_and_process_band(skycell_name_parts: list, band: str, is_mask: bool
 
                 with fits.open(fits_path) as hdul:
                     hdu = hdul[1] if len(hdul) > 1 else hdul[0]
-                    data = hdu.data.astype(np.float32) if not is_mask else hdu.data.astype(np.uint32)
+                    if data_type == "mask":
+                        data = hdu.data.astype(np.uint16)
+                    else:  # image or weight
+                        data = hdu.data.astype(np.float32)
                     header = hdu.header.tostring()
                     return {"data": data, "header": header}
 
@@ -246,9 +264,9 @@ def initialize_zarr_store(zarr_path: Path) -> zarr.Group:
     return root
 
 
-def store_data_in_zarr(root: zarr.Group, projection_id: str, skycell_name: str, band: str, data: np.ndarray, header: str, is_mask: bool, lock_file: Path) -> None:
+def store_data_in_zarr(root: zarr.Group, projection_id: str, skycell_name: str, band: str, data: np.ndarray, header: str, array_name: str, lock_file: Path) -> None:
     """
-    Stores data for a single band/mask in the zarr store.
+    Stores data for a single band/mask/weight in the zarr store.
     Uses filelock for thread-safe operations.
     """
     with FileLock(lock_file):
@@ -260,15 +278,12 @@ def store_data_in_zarr(root: zarr.Group, projection_id: str, skycell_name: str, 
         if skycell_name not in root[projection_id]:
             root[projection_id].create_group(skycell_name)
 
-    # Determine array name based on whether it's a mask or not
-    array_name = f"{band}_mask" if is_mask else band
-
     # Define chunks based on data shape
     chunks = (min(1024, data.shape[0]), min(1024, data.shape[1]))
 
     # Create array with appropriate settings for Zarr v3
     compressor = {"name": "zstd", "configuration": {"level": 3}}
-    fill_value = 0 if is_mask else np.nan
+    fill_value = 0 if "mask" in array_name else np.nan
 
     # Store data in zarr array with thread-safe locking
     with FileLock(lock_file):
@@ -317,11 +332,19 @@ def is_array_complete(root: zarr.Group, projection_id: str, skycell_name: str, a
         return False
 
 
-def process_skycell_band(root: zarr.Group, skycell_name: str, skycell_name_parts: list, band: str, is_mask: bool, projection_id: str, lock_file: Path, use_local_files: bool = False, local_data_path: Optional[Path] = None, overwrite: bool = False) -> bool:
+def process_skycell_band(root: zarr.Group, skycell_name: str, skycell_name_parts: list, band: str, data_type: str, projection_id: str, lock_file: Path, use_local_files: bool = False, local_data_path: Optional[Path] = None, overwrite: bool = False) -> bool:
     """
-    Process a single band/mask for a skycell and store it in the zarr store.
+    Process a single band/data_type for a skycell and store it in the zarr store.
     """
-    array_name = f"{band}_mask" if is_mask else band
+    if data_type == "image":
+        array_name = band
+    elif data_type == "mask":
+        array_name = f"{band}_mask"
+    elif data_type == "weight":
+        array_name = f"{band}_wt"
+    else:
+        logging.error(f"Unknown data_type: {data_type}")
+        return False
 
     # Check if this array already exists and is complete
     if is_array_complete(root, projection_id, skycell_name, array_name, lock_file, overwrite=overwrite):
@@ -329,10 +352,10 @@ def process_skycell_band(root: zarr.Group, skycell_name: str, skycell_name_parts
         return True
 
     # Download and process the band data
-    result = download_and_process_band(skycell_name_parts, band, is_mask, use_local_files, local_data_path)
+    result = download_and_process_band(skycell_name_parts, band, data_type, use_local_files, local_data_path)
     if result:
         # Store data in zarr
-        store_data_in_zarr(root=root, projection_id=projection_id, skycell_name=skycell_name, band=band, data=result["data"], header=result["header"], is_mask=is_mask, lock_file=lock_file)
+        store_data_in_zarr(root=root, projection_id=projection_id, skycell_name=skycell_name, band=band, data=result["data"], header=result["header"], array_name=array_name, lock_file=lock_file)
         return True
 
     return False
@@ -352,7 +375,7 @@ def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: P
     bands = ["r", "i", "z", "y"]
     expected_arrays = []
     for band in bands:
-        expected_arrays.extend([band, f"{band}_mask"])
+        expected_arrays.extend([band, f"{band}_mask", f"{band}_wt"])
 
     # Check if all arrays are complete (unless overwrite requested)
     all_complete = True
@@ -368,30 +391,34 @@ def download_and_store_skycell(root: zarr.Group, skycell_name: str, lock_file: P
     logging.info(f"Processing skycell: {skycell_name}")
     skycell_name_parts = skycell_name.split(".")
 
-    # Process each band and its mask
+    # Process each band and its mask and weight
     for band in bands:
         # Check if shutdown was requested
         if shutdown_requested:
             logging.info("Shutdown requested, stopping skycell processing")
             return
         # Process in parallel using thread pool to speed up download
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             # Register executor for shutdown handling
             active_executors.append(executor)
 
             try:
-                # Submit tasks for image and mask
-                img_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, False, projection_id, lock_file, use_local_files, local_data_path, overwrite)
-                mask_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, True, projection_id, lock_file, use_local_files, local_data_path, overwrite)
+                # Submit tasks for image, mask, and weight
+                img_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, "image", projection_id, lock_file, use_local_files, local_data_path, overwrite)
+                mask_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, "mask", projection_id, lock_file, use_local_files, local_data_path, overwrite)
+                wt_future = executor.submit(process_skycell_band, root, skycell_name, skycell_name_parts, band, "weight", projection_id, lock_file, use_local_files, local_data_path, overwrite)
 
-                # Wait for both tasks to complete
+                # Wait for all tasks to complete
                 img_success = img_future.result()
                 mask_success = mask_future.result()
+                wt_success = wt_future.result()
 
                 if not img_success:
                     logging.warning(f"Failed to process {band} image for {skycell_name}")
                 if not mask_success:
                     logging.warning(f"Failed to process {band} mask for {skycell_name}")
+                if not wt_success:
+                    logging.warning(f"Failed to process {band} weight for {skycell_name}")
 
             finally:
                 # Remove executor from active list

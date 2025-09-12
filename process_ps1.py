@@ -13,7 +13,7 @@ import os
 import signal
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import Process, Queue
 from queue import Empty
@@ -27,7 +27,7 @@ import zarr
 import band_utils
 import convolution_utils
 import zarr_utils
-from band_utils import process_skycell_bands
+from band_utils import process_skycell_bands, remove_background
 from csv_utils import find_csv_file, get_projections_from_csv, load_csv_data
 from zarr_utils import load_skycell_bands_masks_and_headers
 
@@ -198,6 +198,39 @@ def create_master_task_list(df: pd.DataFrame, projection: str) -> tuple[dict, li
 # --- NEW Pipeline Worker Functions ---
 
 
+def process_single_cell(raw_bundle: dict) -> dict:
+    """
+    Standalone function for processing a single cell in a separate process.
+    This function replaces the pre_processor_worker for ProcessPoolExecutor.
+    """
+    try:
+        import logging
+
+        from band_utils import process_skycell_bands, remove_background
+
+        # Set up logging for this process
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"[PreProcessor] Starting {raw_bundle['skycell_id']}")
+        combined_image, combined_mask, combined_uncert = process_skycell_bands(bands_data=raw_bundle["bands_data"], masks_data=raw_bundle["masks_data"], weights_data=raw_bundle["weights_data"], headers_data=raw_bundle["headers_data"], headers_weight_data=raw_bundle["headers_weight_data"])
+
+        logger.info(f"[PreProcessor] Starting Source Extractor {raw_bundle['skycell_id']}")
+        combined_image = remove_background(combined_image, combined_uncert)
+
+        # Return the processed bundle
+        combined_bundle = {"skycell_id": raw_bundle["skycell_id"], "projection": raw_bundle["projection"], "row_id": raw_bundle["row_id"], "x_coord": raw_bundle["x_coord"], "combined_image": combined_image, "combined_mask": combined_mask}
+
+        logger.info(f"[PreProcessor] Processed {raw_bundle['skycell_id']}")
+        return combined_bundle
+
+    except Exception as e:
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.error(f"[PreProcessor] Failed for {raw_bundle['skycell_id']}: {e}", exc_info=True)
+        return None
+
+
 def reader_worker(task_queue: Queue, raw_cell_queue: Queue, zarr_store):
     """Stage 1: Reads raw cell data from Zarr based on tasks."""
     while True:
@@ -206,12 +239,12 @@ def reader_worker(task_queue: Queue, raw_cell_queue: Queue, zarr_store):
             break
         skycell_id, projection, row_id, x_coord = task
         try:
-            bands, masks, headers = zarr_utils.load_skycell_bands_masks_and_headers(zarr_store, projection, skycell_id)
+            bands, masks, weights, headers, headers_weight = zarr_utils.load_skycell_bands_masks_and_headers(zarr_store, projection, skycell_id)
             if not bands:
                 logger.warning(f"[Reader] No band data for {skycell_id}, skipping.")
                 continue
             # SPEC: Pass all metadata, including x_coord, to the next stage.
-            raw_bundle = {"skycell_id": skycell_id, "projection": projection, "row_id": row_id, "x_coord": x_coord, "bands_data": bands, "masks_data": masks, "headers_data": headers}
+            raw_bundle = {"skycell_id": skycell_id, "projection": projection, "row_id": row_id, "x_coord": x_coord, "bands_data": bands, "masks_data": masks, "headers_data": headers, "weights_data": weights, "headers_weight_data": headers_weight}
             raw_cell_queue.put(raw_bundle)
             logger.info(f"[Reader] Loaded {skycell_id}")
         except Exception as e:
@@ -219,19 +252,92 @@ def reader_worker(task_queue: Queue, raw_cell_queue: Queue, zarr_store):
 
 
 def pre_processor_worker(raw_cell_queue: Queue, combined_cell_queue: Queue):
-    """Stage 2: Combines bands for a single cell."""
+    """
+    DEPRECATED: Stage 2 worker for ThreadPoolExecutor (kept for compatibility).
+    Use process_single_cell with ProcessPoolExecutor instead.
+    """
     while True:
         raw_bundle = raw_cell_queue.get()
         if raw_bundle is None:
             break
         try:
-            combined_image, combined_mask = band_utils.process_skycell_bands(raw_bundle["bands_data"], raw_bundle["masks_data"], raw_bundle["headers_data"])
+            logger.info(f"[PreProcessor] Starting {raw_bundle['skycell_id']}")
+            combined_image, combined_mask, combined_uncert = band_utils.process_skycell_bands(bands_data=raw_bundle["bands_data"], masks_data=raw_bundle["masks_data"], weights_data=raw_bundle["weights_data"], headers_data=raw_bundle["headers_data"], headers_weight_data=raw_bundle["headers_weight_data"])
+            logger.info(f"[PreProcessor] Starting Source Extractor {raw_bundle['skycell_id']}")
+            combined_image = remove_background(combined_image, combined_uncert)
             # SPEC: Pass essential metadata through to the assembler stage.
             combined_bundle = {"skycell_id": raw_bundle["skycell_id"], "projection": raw_bundle["projection"], "row_id": raw_bundle["row_id"], "x_coord": raw_bundle["x_coord"], "combined_image": combined_image, "combined_mask": combined_mask}
             combined_cell_queue.put(combined_bundle)
             logger.info(f"[PreProcessor] Processed {raw_bundle['skycell_id']}")
         except Exception as e:
             logger.error(f"[PreProcessor] Failed for {raw_bundle['skycell_id']}: {e}", exc_info=True)
+
+
+def process_coordinator(raw_cell_queue: Queue, combined_cell_queue: Queue, num_workers: int = 4):
+    """
+    Coordinates between raw cell queue and ProcessPoolExecutor for preprocessing.
+    This function runs in a separate thread and bridges the queue-based system
+    with the process-based preprocessing.
+    """
+    logger.info(f"[ProcessCoordinator] Starting with {num_workers} process workers")
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Track submitted futures
+        futures = {}
+        active_tasks = set()
+
+        while True:
+            try:
+                # Get raw bundle from queue (non-blocking check)
+                try:
+                    raw_bundle = raw_cell_queue.get(timeout=1.0)
+                except Exception:
+                    # Timeout or other queue error - continue the loop
+                    continue
+
+                if raw_bundle is None:
+                    logger.info("[ProcessCoordinator] Received shutdown signal")
+                    break
+
+                # Submit to process pool
+                future = executor.submit(process_single_cell, raw_bundle)
+                futures[future] = raw_bundle["skycell_id"]
+                active_tasks.add(future)
+
+                # Check for completed tasks
+                completed = set()
+                for future in list(active_tasks):
+                    if future.done():
+                        completed.add(future)
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                combined_cell_queue.put(result)
+                            else:
+                                logger.warning(f"[ProcessCoordinator] Got None result for {futures[future]}")
+                        except Exception as e:
+                            logger.error(f"[ProcessCoordinator] Process failed for {futures[future]}: {e}")
+
+                        # Clean up
+                        del futures[future]
+
+                active_tasks -= completed
+
+            except Exception as e:
+                logger.error(f"[ProcessCoordinator] Error in coordination loop: {e}", exc_info=True)
+                break
+
+        # Wait for remaining tasks
+        logger.info(f"[ProcessCoordinator] Waiting for {len(active_tasks)} remaining tasks")
+        for future in active_tasks:
+            try:
+                result = future.result(timeout=30)  # 30 second timeout per task
+                if result is not None:
+                    combined_cell_queue.put(result)
+            except Exception as e:
+                logger.error(f"[ProcessCoordinator] Final task failed for {futures.get(future, 'unknown')}: {e}")
+
+    logger.info("[ProcessCoordinator] Finished")
 
 
 def saver_worker(results_queue: Queue, output_path: str):
@@ -353,8 +459,9 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
             try:
                 logger.info(f"Manually loading and processing missing cell: {cell_name}")
                 zarr_store = zarr.open(zarr_path, mode="r")
-                bands_data, masks_data, headers_data = load_skycell_bands_masks_and_headers(zarr_store, projection, cell_name)
-                combined_image, combined_mask = process_skycell_bands(bands_data, masks_data, headers_data)
+                bands_data, masks_data, weights_data, headers_data, headers_weight_data = load_skycell_bands_masks_and_headers(zarr_store, projection, cell_name)
+                combined_image, combined_mask, combined_uncert = process_skycell_bands(bands_data, masks_data, weights_data, headers_data, headers_weight_data)
+                combined_image = remove_background(combined_image, combined_uncert)
 
                 manual_bundle = {
                     "skycell_id": cell_name,
@@ -363,6 +470,7 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
                     "x_coord": expected_cell_info[cell_name],
                     "combined_image": combined_image,
                     "combined_mask": combined_mask,
+                    # "combined_uncert": combined_uncert,
                 }
                 gathered_bundles.append(manual_bundle)
             except Exception as e:
@@ -408,7 +516,6 @@ def process_row_step_from_queue(state: ProcessingState, config: MasterArrayConfi
 
     # 4. Perform Convolution
     nan_mask = np.isnan(state.current_array)
-    state.current_array[nan_mask] = 0
     logger.info(f"Applying convolution for row ID {current_row_id}")
     convolved_array = convolution_utils.apply_gaussian_convolution(state.current_array, sigma=psf_sigma)
     # Restore NaNs on the result, not the state array which will be replaced
@@ -506,15 +613,18 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
     combined_cell_queue = Queue(maxsize=30)
     results_queue = Queue(maxsize=3)
 
-    # --- Start Persistent Workers (Stages 1, 2, 4) ---
+    # --- Start Persistent Workers (Stages 1, 4) ---
     saver_proc = Process(target=saver_worker, args=(results_queue, output_path))
     saver_proc.start()
 
-    with ThreadPoolExecutor(max_workers=num_pre_processors) as pre_proc_executor, ThreadPoolExecutor(max_workers=num_readers) as reader_executor:
-        for _ in range(num_pre_processors):
-            pre_proc_executor.submit(pre_processor_worker, raw_cell_queue, combined_cell_queue)
+    # Start the process coordinator in a separate thread
+    import threading
 
-        # Start Stage 1 workers
+    process_coordinator_thread = threading.Thread(target=process_coordinator, args=(raw_cell_queue, combined_cell_queue, num_pre_processors), daemon=True)
+    process_coordinator_thread.start()
+
+    with ThreadPoolExecutor(max_workers=num_readers) as reader_executor:
+        # Start Stage 1 workers (readers only - preprocessing now handled by process coordinator)
         for _ in range(num_readers):
             reader_executor.submit(reader_worker, task_queue, raw_cell_queue, zarr_store)
 
@@ -543,8 +653,13 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
 
         # --- Final Shutdown Sequence ---
         logger.info("Sequential processor finished. Shutting down upstream workers.")
-        for _ in range(num_pre_processors):
-            raw_cell_queue.put(None)
+        # Signal the process coordinator to shutdown
+        raw_cell_queue.put(None)
+
+        # Wait for process coordinator thread to finish
+        if process_coordinator_thread.is_alive():
+            logger.info("Waiting for process coordinator to finish...")
+            process_coordinator_thread.join(timeout=30)
 
     saver_proc.join()
     logger.info("Pipeline completed successfully!")
