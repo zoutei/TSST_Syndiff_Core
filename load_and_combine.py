@@ -43,12 +43,12 @@ def _producer_loader(tasks_queue, processed_queue, zarr_path):
         except KeyError:
             # This is a common, expected error if a skycell doesn't exist.
             # Log it as a warning instead of an error to reduce noise.
-            logger.warning(f"KeyError: Skycell '{skycell}' not found in projection '{projection}'. Skipping task.")
+            logger.warning(f"[Loader] KeyError: Skycell '{skycell}' not found in projection '{projection}'. Skipping task.")
         except Exception as e:
             # Catch any other unexpected errors and log the full traceback
-            logger.error(f"Producer failed to load {projection}/{skycell} with an unexpected error: {e}", exc_info=True)
+            logger.error(f"[Loader] Producer failed to load {projection}/{skycell} with an unexpected error: {e}", exc_info=True)
 
-    logger.info("Producer has finished loading all tasks.")
+    logger.info("[Loader] Producer has finished loading all tasks.")
 
 
 def _consumer_processor(processed_queue, results_dict):
@@ -99,9 +99,9 @@ def _consumer_processor(processed_queue, results_dict):
                 results_dict[key] = current_dict
 
         except Exception as e:
-            logger.error(f"Consumer failed to process {projection}/{skycell}: {e}")
+            logger.error(f"[Loader] Consumer failed to process {projection}/{skycell}: {e}")
 
-    logger.info("A consumer process has finished.")
+    logger.info("[Loader] A consumer process has finished.")
 
 
 def run_processing_pipeline(zarr_path: str, skycells_to_process: list[tuple[str, str]], num_producers: int = 4, num_consumers: int = 4):
@@ -147,7 +147,7 @@ def run_processing_pipeline(zarr_path: str, skycells_to_process: list[tuple[str,
             for _ in range(num_consumers):
                 processed_queue.put(None)
 
-        logger.info("Pipeline execution complete.")
+        logger.info("[Loader] Pipeline execution complete.")
         # Convert the Manager dict to a regular Python dict
         return {k: dict(v) for k, v in results_dict.items()}
 

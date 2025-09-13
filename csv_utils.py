@@ -22,10 +22,10 @@ def load_csv_data(csv_path: str) -> pd.DataFrame:
     """
     try:
         df = pd.read_csv(csv_path)
-        logger.info(f"Loaded CSV with {len(df)} rows from {csv_path}")
+        logger.info(f"[CSV] Loaded CSV with {len(df)} rows from {csv_path}")
         return df
     except Exception as e:
-        logger.error(f"Failed to load CSV {csv_path}: {e}")
+        logger.error(f"[CSV] Failed to load CSV {csv_path}: {e}")
         raise
 
 
@@ -42,7 +42,7 @@ def get_projections_from_csv(csv_path: str) -> list[str]:
     projections = df["projection"].astype(str).unique()
     projections = sorted(projections)
 
-    logger.info(f"Found {len(projections)} projections: {projections[:5]}...")
+    logger.info(f"[CSV] Found {len(projections)} projections: {projections[:5]}...")
     return projections
 
 
@@ -72,7 +72,7 @@ def get_projection_rows(csv_path: str, projection: str) -> dict[int, list[str]]:
     for row_id in rows:
         rows[row_id].sort()
 
-    logger.info(f"Found {len(rows)} rows for projection {projection}")
+    logger.info(f"[CSV] Found {len(rows)} rows for projection {projection}")
     return rows
 
 
@@ -90,7 +90,7 @@ def get_padding_info(csv_path: str, skycell: str) -> dict[str, list[str]]:
     cell_row = df[df["skycell"] == skycell]
 
     if len(cell_row) == 0:
-        logger.warning(f"Skycell {skycell} not found in CSV")
+        logger.warning(f"[CSV] Skycell {skycell} not found in CSV")
         return {}
 
     row = cell_row.iloc[0]
@@ -110,7 +110,7 @@ def get_padding_info(csv_path: str, skycell: str) -> dict[str, list[str]]:
             if padding_cells:
                 padding_info[direction] = padding_cells
 
-    logger.debug(f"Found {len(padding_info)} padding directions for {skycell}")
+    logger.debug(f"[CSV] Found {len(padding_info)} padding directions for {skycell}")
     return padding_info
 
 
@@ -142,7 +142,7 @@ def get_all_padding_cells(csv_path: str, skycell_list: list[str]) -> dict[str, l
         all_padding[skycell] = padding_cells
         unique_padding_cells.update(padding_cells)
 
-    logger.info(f"Found {len(unique_padding_cells)} unique padding cells for {len(skycell_list)} skycells")
+    logger.info(f"[CSV] Found {len(unique_padding_cells)} unique padding cells for {len(skycell_list)} skycells")
     return all_padding
 
 
@@ -165,7 +165,7 @@ def find_csv_file(data_root: str, sector: int, camera: int, ccd: int) -> str:
     csv_path = f"{data_root}/skycell_pixel_mapping/{sector_str}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_skycells_list.csv"
 
     if os.path.exists(csv_path):
-        logger.info(f"Found CSV file: {csv_path}")
+        logger.info(f"[CSV] Found CSV file: {csv_path}")
         return csv_path
 
     # If main file not found, raise error with helpful message

@@ -30,7 +30,7 @@ def extract_header_values(header_string: str) -> tuple[float, float, float]:
         exptime = float(header["EXPTIME"])
         return boffset, bsoften, exptime
     except Exception as e:
-        logger.warning(f"Failed to parse header, using defaults: {e}")
+        logger.warning(f"[Band] Failed to parse header, using defaults: {e}")
         return 1000.0, 1000.0, 1.0
 
 
@@ -63,7 +63,7 @@ def _process_single_band(band_data, weight, header_str=None):
         band_data = apply_flux_conversion(band_data, boffset, bsoften, exptime)
     # If no header, use default flux conversion values
     else:
-        logger.warning("No header data available for a band, using default flux conversion.")
+        logger.warning("[Band] No header data available for a band, using default flux conversion.")
         band_data = apply_flux_conversion(band_data)  # Uses defaults
 
     # Return the weighted contribution
@@ -82,7 +82,7 @@ def combine_rizy_bands_parallel(bands_data: dict[str, np.ndarray], weights: list
     tasks = []
     for i, band in enumerate(bands):
         if band not in bands_data:
-            logger.warning(f"Missing band {band}, skipping")
+            logger.warning(f"[Band] Missing band {band}, skipping")
             continue
 
         current_band_data = bands_data[band]
@@ -105,7 +105,7 @@ def combine_rizy_bands_parallel(bands_data: dict[str, np.ndarray], weights: list
 
     combined = np.sum(processed_bands, axis=0)
 
-    logger.debug(f"Combined {len(processed_bands)} bands, range: [{combined.min():.3f}, {combined.max():.3f}]")
+    logger.debug(f"[Band] Combined {len(processed_bands)} bands, range: [{combined.min():.3f}, {combined.max():.3f}]")
     return combined
 
 
@@ -142,7 +142,7 @@ def combine_rizy_bands(bands_data: dict[str, np.ndarray], weights: list[float] =
     # Process and combine each band
     for i, band in enumerate(bands):
         if band not in bands_data:
-            logger.warning(f"Missing band {band}, skipping")
+            logger.warning(f"[Band] Missing band {band}, skipping")
             continue
 
         band_data = bands_data[band].astype(np.float32)
@@ -151,10 +151,10 @@ def combine_rizy_bands(bands_data: dict[str, np.ndarray], weights: list[float] =
             # Extract header values for this specific band
             if headers_data and band in headers_data:
                 boffset, bsoften, exptime = extract_header_values(headers_data[band])
-                logger.debug(f"Band {band}: using BOFFSET={boffset}, BSOFTEN={bsoften}, EXPTIME={exptime}")
+                logger.debug(f"[Band] Band {band}: using BOFFSET={boffset}, BSOFTEN={bsoften}, EXPTIME={exptime}")
                 band_data = apply_flux_conversion(band_data, boffset, bsoften, exptime)
             else:
-                logger.warning(f"Band {band}: no header data available")
+                logger.warning(f"[Band] Band {band}: no header data available")
 
         # Add weighted contribution
         combined += band_data * weights[i]
@@ -164,15 +164,15 @@ def combine_rizy_bands(bands_data: dict[str, np.ndarray], weights: list[float] =
 
             if headers_weight_data and band in headers_weight_data:
                 boffset_wt, bsoften_wt, exptime_wt = extract_header_values(headers_weight_data[band])
-                logger.debug(f"Band {band} weights: using BOFFSET={boffset_wt}, BSOFTEN={bsoften_wt}, EXPTIME={exptime_wt}")
+                logger.debug(f"[Band] Band {band} weights: using BOFFSET={boffset_wt}, BSOFTEN={bsoften_wt}, EXPTIME={exptime_wt}")
                 band_weight = apply_flux_conversion(band_weight, boffset_wt, bsoften_wt, exptime_wt, std=True)
             else:
-                logger.warning(f"Band {band} weights: no header data available")
+                logger.warning(f"[Band] Band {band} weights: no header data available")
 
             combined_uncert += (band_weight**2) * (weights[i] ** 2)
 
     combined_uncert = np.sqrt(combined_uncert)
-    logger.debug(f"Combined {len(bands_data)} bands, range: [{combined.min():.3f}, {combined.max():.3f}]")
+    logger.debug(f"[Band] Combined {len(bands_data)} bands, range: [{combined.min():.3f}, {combined.max():.3f}]")
     return combined, combined_uncert
 
 
@@ -194,7 +194,7 @@ def combine_masks(masks_data: dict[str, np.ndarray]) -> np.ndarray:
 
     # 2. Handle the case where no valid masks were found.
     if not valid_masks:
-        logger.warning("No masks available to combine.")
+        logger.warning("[Band] No masks available to combine.")
         return None
 
     # 3. Use np.bitwise_or.reduce to combine all arrays in the list at once.
@@ -205,7 +205,7 @@ def combine_masks(masks_data: dict[str, np.ndarray]) -> np.ndarray:
     # Note: For a bitmask, counting non-zero elements is a more accurate
     # way to find the number of affected pixels than using .sum().
     masked_pixel_count = np.count_nonzero(combined)
-    logger.debug(f"Combined {len(valid_masks)} masks, {masked_pixel_count} masked pixels")
+    logger.debug(f"[Band] Combined {len(valid_masks)} masks, {masked_pixel_count} masked pixels")
 
     return combined
 
@@ -255,7 +255,7 @@ def remove_background(data: np.ndarray, uncert: np.ndarray = None, sigma: float 
         objects, segmap = sep.extract(data_s, sigma, err=uncert_s, mask=mask_bright_stars, segmentation_map=True)
         data[np.logical_and(segmap == 0, ~mask_bright_stars)] = 0
     except Exception as e:
-        logging.error(f"SEP extraction failed: {e}")
+        logging.error(f"[Band] SEP extraction failed: {e}")
         return data
 
     return data
