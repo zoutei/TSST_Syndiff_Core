@@ -237,7 +237,7 @@ def process_skycell_bands(bands_data: dict[str, np.ndarray], masks_data: dict[st
     return combined_image, combined_mask, combined_uncert
 
 
-def remove_background(data: np.ndarray, uncert: np.ndarray = None, sigma: float = 2.5) -> np.ndarray:
+def remove_background(data: np.ndarray, uncert: np.ndarray = None, sigma: float = 2.5, sigma_mask: float = 20) -> np.ndarray:
     """Remove background from image using SEP.
 
     Args:
@@ -247,10 +247,15 @@ def remove_background(data: np.ndarray, uncert: np.ndarray = None, sigma: float 
     Returns:
         Background-subtracted image
     """
-    data_s = data.astype(data.dtype.newbyteorder("="))
-    uncert_s = uncert.astype(uncert.dtype.newbyteorder("="))
-    objects, segmap = sep.extract(data_s, sigma, err=uncert_s, segmentation_map=True)
-
-    data[segmap == 0] = 0
+    try:
+        mask_bright_stars = data > np.nanmedian(uncert) * sigma_mask
+        data_s = data.astype(data.dtype.newbyteorder("="))
+        uncert_s = uncert.astype(uncert.dtype.newbyteorder("="))
+        sep.set_extract_pixstack(1000000)
+        objects, segmap = sep.extract(data_s, sigma, err=uncert_s, mask=mask_bright_stars, segmentation_map=True)
+        data[np.logical_and(segmap == 0, ~mask_bright_stars)] = 0
+    except Exception as e:
+        logging.error(f"SEP extraction failed: {e}")
+        return data
 
     return data
