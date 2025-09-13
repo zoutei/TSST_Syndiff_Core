@@ -40,7 +40,16 @@ CELL_OVERLAP = 480
 EDGE_EXCLUSION = 10
 EFFECTIVE_OVERLAP = CELL_OVERLAP - EDGE_EXCLUSION
 PAD_SIZE = 480
-GATHER_TIMEOUT_SECONDS = 300  # 5 minutes
+
+GATHER_TIMEOUT_SECONDS = 180
+MAX_ACTIVE_TASKS = 35  # Maximum concurrent preprocessing tasks
+MAX_TOTAL_PENDING_WORK = 30  # Maximum total pending work (queue + buffer + active tasks)
+QUEUE_CHECK_INTERVAL = 20  # Log queue state every N iterations
+
+
+def calculate_total_buffer_size(cell_buffer: dict) -> int:
+    """Calculate total number of cells in the buffer across all projection/row combinations."""
+    return sum(len(cells) for cells in cell_buffer.values())
 
 
 # --- Data Structures (Retained) ---
@@ -158,7 +167,7 @@ def extract_projection_metadata(df: pd.DataFrame, projection: str) -> dict:
 
     all_dims = list(cell_dimensions.values())
     if len(set(all_dims)) > 1:
-        logger.warning(f"Inconsistent cell dimensions found: {set(all_dims)}")
+        logger.warning(f"[Metadata] Inconsistent cell dimensions found: {set(all_dims)}")
     typical_width, typical_height = max(all_dims, key=lambda item: item[0] * item[1]) if all_dims else (0, 0)
     max_cells_per_row = max(len(cells) for cells in rows.values()) if rows else 0
 
@@ -273,13 +282,15 @@ def pre_processor_worker(raw_cell_queue: Queue, combined_cell_queue: Queue):
             logger.error(f"[PreProcessor] Failed for {raw_bundle['skycell_id']}: {e}", exc_info=True)
 
 
-def process_coordinator(raw_cell_queue: Queue, combined_cell_queue: Queue, num_workers: int = 4):
+def process_coordinator(raw_cell_queue: Queue, combined_cell_queue: Queue, cell_buffer: dict, num_workers: int = 4):
     """
     Coordinates between raw cell queue and ProcessPoolExecutor for preprocessing.
     This function runs in a separate thread and bridges the queue-based system
     with the process-based preprocessing.
     """
     logger.info(f"[ProcessCoordinator] Starting with {num_workers} process workers")
+
+    iteration_count = 0
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         # Track submitted futures
@@ -288,23 +299,16 @@ def process_coordinator(raw_cell_queue: Queue, combined_cell_queue: Queue, num_w
 
         while True:
             try:
-                # Get raw bundle from queue (non-blocking check)
-                try:
-                    raw_bundle = raw_cell_queue.get(timeout=1.0)
-                except Exception:
-                    # Timeout or other queue error - continue the loop
-                    continue
+                iteration_count += 1
 
-                if raw_bundle is None:
-                    logger.info("[ProcessCoordinator] Received shutdown signal")
-                    break
+                # Periodic queue monitoring
+                if iteration_count % QUEUE_CHECK_INTERVAL == 0:
+                    current_queue_size = combined_cell_queue.qsize()
+                    current_buffer_size = calculate_total_buffer_size(cell_buffer)
+                    total_pending = current_queue_size + current_buffer_size
+                    logger.info(f"[ProcessCoordinator] Queue States - Raw: {raw_cell_queue.qsize()}, Combined: {current_queue_size}, Buffer: {current_buffer_size}, Active Tasks: {len(active_tasks)}, Total Pending: {total_pending}")
 
-                # Submit to process pool
-                future = executor.submit(process_single_cell, raw_bundle)
-                futures[future] = raw_bundle["skycell_id"]
-                active_tasks.add(future)
-
-                # Check for completed tasks
+                # ALWAYS check for completed tasks first on every iteration
                 completed = set()
                 for future in list(active_tasks):
                     if future.done():
@@ -317,11 +321,51 @@ def process_coordinator(raw_cell_queue: Queue, combined_cell_queue: Queue, num_w
                                 logger.warning(f"[ProcessCoordinator] Got None result for {futures[future]}")
                         except Exception as e:
                             logger.error(f"[ProcessCoordinator] Process failed for {futures[future]}: {e}")
-
                         # Clean up
                         del futures[future]
-
                 active_tasks -= completed
+
+                # Get raw bundle from queue (non-blocking check)
+                try:
+                    raw_bundle = raw_cell_queue.get(timeout=1.0)
+                except Exception:
+                    # Timeout or other queue error - continue the loop
+                    continue
+
+                if raw_bundle is None:
+                    logger.info("[ProcessCoordinator] Received shutdown signal")
+                    break
+
+                # NEW: Check capacity before submitting (including buffer size)
+                current_queue_size = combined_cell_queue.qsize()
+                current_buffer_size = calculate_total_buffer_size(cell_buffer)
+                total_pending = len(active_tasks) + current_queue_size + current_buffer_size
+
+                if total_pending >= MAX_TOTAL_PENDING_WORK:
+                    # Don't submit, put raw_bundle back and process completions
+                    raw_cell_queue.put(raw_bundle)
+                    # Process completions and continue without submission
+                    completed = set()
+                    for future in list(active_tasks):
+                        if future.done():
+                            completed.add(future)
+                            try:
+                                result = future.result()
+                                if result is not None:
+                                    combined_cell_queue.put(result)
+                                else:
+                                    logger.warning(f"[ProcessCoordinator] Got None result for {futures[future]}")
+                            except Exception as e:
+                                logger.error(f"[ProcessCoordinator] Process failed for {futures[future]}: {e}")
+                            # Clean up
+                            del futures[future]
+                    active_tasks -= completed
+                    continue  # Skip submission this iteration
+
+                # Submit to process pool only if we have capacity
+                future = executor.submit(process_single_cell, raw_bundle)
+                futures[future] = raw_bundle["skycell_id"]
+                active_tasks.add(future)
 
             except Exception as e:
                 logger.error(f"[ProcessCoordinator] Error in coordination loop: {e}", exc_info=True)
@@ -400,9 +444,9 @@ def assemble_row_from_bundles(target_array: np.ndarray, cell_bundles: list[dict]
             cell_masks[cell_name] = mask
             cell_positions[cell_name] = (target_x_start_full, target_x_start_full + config.cell_width, PAD_SIZE, PAD_SIZE + config.cell_height)
         else:
-            logger.warning(f"Cell {cell_name} out of bounds for master array. Skipping placement.")
+            logger.warning(f"[Assembler] Cell {cell_name} out of bounds for master array. Skipping placement.")
 
-    logger.info(f"Assembled row with {len(cell_bundles)} cells.")
+    logger.info(f"[Assembler] Assembled row with {len(cell_bundles)} cells.")
     return cell_positions, cell_masks
 
 
@@ -411,6 +455,8 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
     Gathers all necessary cell bundles for a given row from the queue.
     Handles out-of-order arrivals using a buffer and has a timeout mechanism
     to manually load/process cells if they don't arrive in time.
+
+    Timeout is measured from the last arrival of a cell for the same projection/row.
     """
     expected_cells = metadata["rows"].get(row_id, [])
     num_to_expect = len(expected_cells)
@@ -421,32 +467,58 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
     key = (projection, row_id)
     gathered_bundles = cell_buffer.pop(key, [])
 
-    last_arrival_time = time.time()
+    logger.info(f"[Gather] Gathering {num_to_expect} cells for P:{projection} R:{row_id}")
+    logger.info(f"[Gather] Expected cells: {[cell[0] for cell in expected_cells]}")
+    logger.info(f"[Gather] Queue size at start: {combined_cell_queue.qsize()}")
+    logger.info(f"[Gather] Already buffered: {len(gathered_bundles)} cells")
+
+    # Track both function start time and last relevant cell arrival time
+    function_start_time = time.time()
+    last_relevant_arrival_time = time.time() if len(gathered_bundles) > 0 else None
+    loop_count = 0
+
     while len(gathered_bundles) < num_to_expect:
-        remaining_time = GATHER_TIMEOUT_SECONDS - (time.time() - last_arrival_time)
+        loop_count += 1
+
+        # Calculate timeout from last relevant arrival, or from function start if none yet
+        if last_relevant_arrival_time is not None:
+            time_since_last_relevant = time.time() - last_relevant_arrival_time
+            remaining_time = GATHER_TIMEOUT_SECONDS - time_since_last_relevant
+        else:
+            # If no relevant cells yet, calculate from function start
+            time_since_function_start = time.time() - function_start_time
+            remaining_time = GATHER_TIMEOUT_SECONDS - time_since_function_start
+
+        # Periodic logging
+        if loop_count % 10 == 0:
+            logger.info(f"[Gather] Still gathering P:{projection} R:{row_id}, have {len(gathered_bundles)}/{num_to_expect}, queue_size: {combined_cell_queue.qsize()}, remaining_timeout: {remaining_time:.1f}s")
+
         if remaining_time <= 0:
-            logger.warning(f"Timeout waiting for cells for P:{projection} R:{row_id}. Manually loading missing cells.")
+            logger.warning(f"[Gather] Timeout waiting for cells for P:{projection} R:{row_id}. {GATHER_TIMEOUT_SECONDS}s since last relevant cell. Manually loading missing cells.")
             break  # Exit loop to proceed with manual loading
 
         try:
-            # Wait for the next cell with a calculated timeout
-            bundle = combined_cell_queue.get(timeout=remaining_time)
+            # Wait for the next cell with calculated timeout
+            bundle = combined_cell_queue.get(timeout=min(remaining_time, 5.0))  # Max 5 second wait per iteration
             if bundle is None:
-                logger.warning("Shutdown signal received while gathering cells.")
+                logger.warning("[Gather] Shutdown signal received while gathering cells.")
                 break
 
-            last_arrival_time = time.time()  # Reset timer on successful arrival
             bundle_key = (bundle["projection"], bundle["row_id"])
 
             if bundle_key == key:
+                # This is a cell for our target row/projection
                 gathered_bundles.append(bundle)
+                last_relevant_arrival_time = time.time()  # Reset timer on relevant arrival
+                logger.debug(f"[Gather] Received relevant cell {bundle['skycell_id']} for P:{projection} R:{row_id}")
             else:
-                # It's for a future row/projection, so buffer it
+                # It's for a different row/projection, so buffer it
                 cell_buffer.setdefault(bundle_key, []).append(bundle)
+                logger.debug(f"[Gather] Buffered cell {bundle['skycell_id']} for P:{bundle['projection']} R:{bundle['row_id']}")
 
         except Empty:
-            logger.warning(f"Timeout hit via queue.get() for P:{projection} R:{row_id}. Manually loading.")
-            break  # Exit loop to proceed with manual loading
+            # Timeout on queue.get() - continue loop to check overall timeout
+            continue
 
     # If, after waiting, cells are still missing, load them manually
     if len(gathered_bundles) < num_to_expect:
@@ -454,10 +526,10 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
         expected_cell_info = {name: x for name, x in expected_cells}
         missing_cell_names = set(expected_cell_info.keys()) - received_cell_names
 
-        logger.info(f"Identified {len(missing_cell_names)} missing cells for P:{projection} R:{row_id}.")
+        logger.warning(f"[Gather] Identified {len(missing_cell_names)} missing cells for P:{projection} R:{row_id}: {missing_cell_names}")
         for cell_name in missing_cell_names:
             try:
-                logger.info(f"Manually loading and processing missing cell: {cell_name}")
+                logger.info(f"[ManualPreProcessor] Manually loading and processing missing cell: {cell_name}")
                 zarr_store = zarr.open(zarr_path, mode="r")
                 bands_data, masks_data, weights_data, headers_data, headers_weight_data = load_skycell_bands_masks_and_headers(zarr_store, projection, cell_name)
                 combined_image, combined_mask, combined_uncert = process_skycell_bands(bands_data, masks_data, weights_data, headers_data, headers_weight_data)
@@ -474,8 +546,9 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
                 }
                 gathered_bundles.append(manual_bundle)
             except Exception as e:
-                logger.error(f"Failed to manually load/process {cell_name}: {e}", exc_info=True)
+                logger.error(f"[ManualPreProcessor] Failed to manually load/process {cell_name}: {e}", exc_info=True)
 
+    logger.info(f"[Gather] Successfully gathered {len(gathered_bundles)}/{num_to_expect} cells for P:{projection} R:{row_id}")
     return gathered_bundles
 
 
@@ -486,37 +559,37 @@ def process_row_step_from_queue(state: ProcessingState, config: MasterArrayConfi
     """
     # 1. Load the Current Row (Only If Necessary)
     if state.current_row_id != current_row_id:
-        logger.info(f"Loading initial current row ID {current_row_id}")
+        logger.info(f"[SequentialProcessor] Loading initial current row ID {current_row_id}")
         current_row_bundles = _gather_cells_for_row(projection, current_row_id, metadata, combined_cell_queue, cell_buffer, zarr_path)
         positions, masks = assemble_row_from_bundles(state.current_array, current_row_bundles, config)
         state.cell_locations.update(positions)
         state.current_masks.update(masks)
         state.current_row_id = current_row_id
-        logger.info(f"Built current row ID {current_row_id} with {len(positions)} cells.")
+        logger.info(f"[SequentialProcessor] Built current row ID {current_row_id} with {len(positions)} cells.")
 
     # 2. Load the Next Row (Always)
     if next_row_id is not None:
-        logger.info(f"Preparing next row ID {next_row_id}")
+        logger.info(f"[SequentialProcessor] Preparing next row ID {next_row_id}")
         next_row_bundles = _gather_cells_for_row(projection, next_row_id, metadata, combined_cell_queue, cell_buffer, zarr_path)
         positions, masks = assemble_row_from_bundles(state.next_array, next_row_bundles, config)
         state.next_cell_locations.update(positions)
         state.next_masks.update(masks)
         state.next_row_id = next_row_id
-        logger.info(f"Prepared next row ID {next_row_id} with {len(state.next_cell_locations)} cells.")
+        logger.info(f"[SequentialProcessor] Prepared next row ID {next_row_id} with {len(state.next_cell_locations)} cells.")
     else:
         # Clear next state if there is no next row
         state.next_array.fill(np.nan)
         state.next_cell_locations.clear()
         state.next_masks.clear()
         state.next_row_id = None
-        logger.info("No next row to prepare.")
+        logger.info("[SequentialProcessor] No next row to prepare.")
 
     # 3. Apply Cross-Row Padding
     apply_cross_row_padding(state, config)
 
     # 4. Perform Convolution
     nan_mask = np.isnan(state.current_array)
-    logger.info(f"Applying convolution for row ID {current_row_id}")
+    logger.info(f"[SequentialProcessor] Applying convolution for row ID {current_row_id}")
     convolved_array = convolution_utils.apply_gaussian_convolution(state.current_array, sigma=psf_sigma)
     # Restore NaNs on the result, not the state array which will be replaced
     convolved_array[nan_mask] = np.nan
@@ -528,23 +601,21 @@ def process_row_step_from_queue(state: ProcessingState, config: MasterArrayConfi
     return results_data, results_masks
 
 
-def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell_queue: Queue, results_queue: Queue, psf_sigma: float, zarr_path: str):
+def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell_queue: Queue, results_queue: Queue, psf_sigma: float, zarr_path: str, cell_buffer: dict):
     """
     SPEC: This is Stage 3. It iterates through projections sequentially,
     calling a helper function to process each row, queues results, and manages
     the sliding window state.
     """
     for projection in projections:
-        logger.info(f"--- Starting sequential processing for projection: {projection} ---")
-        # Initialize buffer once per projection
-        cell_buffer = {}
+        logger.info(f"[SequentialProcessor] --- Starting sequential processing for projection: {projection} ---")
         try:
             metadata = extract_projection_metadata(df, projection)
             config = create_master_array_config(metadata)
             state = initialize_processing_state(config)
             row_ids = sorted(metadata["rows"].keys())
         except Exception as e:
-            logger.error(f"Failed to initialize projection {projection}: {e}. Skipping.")
+            logger.error(f"[SequentialProcessor] Failed to initialize projection {projection}: {e}. Skipping.")
             # Attempt to drain the queue of cells for this failed projection
             num_cells_to_skip = sum(len(cells) for _, cells in metadata.get("rows", {}).items())
             for _ in range(num_cells_to_skip):
@@ -556,7 +627,8 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
 
         # Inner Loop: Process each row
         for i, current_row_id in enumerate(row_ids):
-            logger.info(f"--- Processing step for row {i + 1}/{len(row_ids)}: ROW ID {current_row_id} ---")
+            logger.info(f"[SequentialProcessor] --- Processing step for row {i + 1}/{len(row_ids)}: ROW ID {current_row_id} ---")
+            logger.info(f"[SequentialProcessor] Combined queue size: {combined_cell_queue.qsize()}")
 
             # Determine Next Row
             next_row_id = row_ids[i + 1] if i + 1 < len(row_ids) else None
@@ -567,13 +639,13 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
             # Queue the Results
             processed_bundle = {"projection": projection, "row_id": current_row_id, "results_data": results_data, "results_masks": results_masks}
             results_queue.put(processed_bundle)
-            logger.info(f"Finished processing and queued results for row {current_row_id}")
+            logger.info(f"[SequentialProcessor] Finished processing and queued results for row {current_row_id}")
 
             # Advance the Window if not the last row
             if next_row_id is not None:
                 advance_sliding_window(state)
 
-        logger.info(f"--- Finished sequential processing for projection: {projection} ---")
+        logger.info(f"[SequentialProcessor] --- Finished sequential processing for projection: {projection} ---")
 
     # Shutdown Signal for the saver
     results_queue.put(None)
@@ -588,7 +660,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
     _child_processes.clear()
     signal.signal(signal.SIGINT, shutdown_handler)
 
-    logger.info(f"Starting pipeline for sector {sector}, camera {camera}, ccd {ccd}")
+    logger.info(f"[Pipeline] Starting pipeline for sector {sector}, camera {camera}, ccd {ccd}")
     zarr_path = f"{data_root}/ps1_skycells_zarr/ps1_skycells.zarr"
     output_path = f"{data_root}/convolved_results/sector_{sector:04d}_camera_{camera}_ccd_{ccd}.zarr"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -600,7 +672,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
             projections = projections[:projections_limit]
         df = load_csv_data(csv_path)
     except Exception as e:
-        logger.error(f"Failed to load configuration: {e}")
+        logger.error(f"[Pipeline] Failed to load configuration: {e}")
         return {"error": str(e)}
 
     # --- Setup ---
@@ -612,6 +684,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
     raw_cell_queue = Queue(maxsize=20)
     combined_cell_queue = Queue(maxsize=30)
     results_queue = Queue(maxsize=3)
+    cell_buffer = {}  # Shared buffer for all projections
 
     # --- Start Persistent Workers (Stages 1, 4) ---
     saver_proc = Process(target=saver_worker, args=(results_queue, output_path))
@@ -620,7 +693,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
     # Start the process coordinator in a separate thread
     import threading
 
-    process_coordinator_thread = threading.Thread(target=process_coordinator, args=(raw_cell_queue, combined_cell_queue, num_pre_processors), daemon=True)
+    process_coordinator_thread = threading.Thread(target=process_coordinator, args=(raw_cell_queue, combined_cell_queue, cell_buffer, num_pre_processors), daemon=True)
     process_coordinator_thread.start()
 
     with ThreadPoolExecutor(max_workers=num_readers) as reader_executor:
@@ -629,7 +702,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
             reader_executor.submit(reader_worker, task_queue, raw_cell_queue, zarr_store)
 
         # --- Dispatch All Tasks ---
-        logger.info(f"Dispatching tasks for {len(projections)} projections.")
+        logger.info(f"[Pipeline] Dispatching tasks for {len(projections)} projections.")
         master_task_list = []
         for projection in projections:
             try:
@@ -638,31 +711,31 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
                     for cell_name, x_coord in cells:
                         master_task_list.append((cell_name, projection, row_id, x_coord))
             except Exception as e:
-                logger.error(f"Failed to create tasks for projection {projection}: {e}")
+                logger.error(f"[Pipeline] Failed to create tasks for projection {projection}: {e}")
 
         for task in master_task_list:
             task_queue.put(task)
-        logger.info("All tasks have been dispatched to the reader workers.")
+        logger.info("[Pipeline] All tasks have been dispatched to the reader workers.")
 
         # --- Signal Reader Shutdown ---
         for _ in range(num_readers):
             task_queue.put(None)
 
         # --- Run Sequential Processor (Stage 3) in Main Thread ---
-        sequential_processor(projections, df, combined_cell_queue, results_queue, psf_sigma, zarr_path)
+        sequential_processor(projections, df, combined_cell_queue, results_queue, psf_sigma, zarr_path, cell_buffer)
 
         # --- Final Shutdown Sequence ---
-        logger.info("Sequential processor finished. Shutting down upstream workers.")
+        logger.info("[Pipeline] Sequential processor finished. Shutting down upstream workers.")
         # Signal the process coordinator to shutdown
         raw_cell_queue.put(None)
 
         # Wait for process coordinator thread to finish
         if process_coordinator_thread.is_alive():
-            logger.info("Waiting for process coordinator to finish...")
+            logger.info("[Pipeline] Waiting for process coordinator to finish...")
             process_coordinator_thread.join(timeout=30)
 
     saver_proc.join()
-    logger.info("Pipeline completed successfully!")
+    logger.info("[Pipeline] Pipeline completed successfully!")
     return {"status": "success"}
 
 
@@ -670,13 +743,13 @@ def shutdown_handler(signum, frame):
     """
     Handles SIGINT (Ctrl+C) to ensure all child processes are terminated.
     """
-    logger.warning("Ctrl+C detected! Initiating graceful shutdown...")
+    logger.warning("[Pipeline] Ctrl+C detected! Initiating graceful shutdown...")
     for p in _child_processes:
         if p.is_alive():
-            logger.info(f"Terminating process: {p.name} (PID: {p.pid})")
+            logger.info(f"[Pipeline] Terminating process: {p.name} (PID: {p.pid})")
             p.terminate()
             p.join()
-    logger.info("All child processes terminated. Exiting.")
+    logger.info("[Pipeline] All child processes terminated. Exiting.")
     sys.exit(1)
 
 
