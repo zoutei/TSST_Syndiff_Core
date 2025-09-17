@@ -26,6 +26,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.io.fits.verify import VerifyWarning
 from astropy.wcs import WCS, FITSFixedWarning
+from astroquery.gaia import Gaia
 from mocpy import MOC
 from numba import jit
 from shapely.geometry import Polygon
@@ -1331,6 +1332,173 @@ def save_updated_skycell_csv(selected_skycells, output_path, sector, camera_id, 
 
 
 # ============================================================================
+# GAIA CATALOG DOWNLOAD UTILITIES
+# ============================================================================
+
+
+def download_gaia_catalog(tess_wcs, data_shape, output_path, sector, camera_id, ccd_id, pixel_padding=50, magnitude_limit=18):
+    """
+    Download Gaia catalog for the FFI footprint with padding.
+
+    Args:
+        tess_wcs (WCS): TESS WCS object
+        data_shape (tuple): Shape of TESS image (height, width)
+        output_path (str): Base output directory
+        sector (int): TESS sector number
+        camera_id (int): Camera ID
+        ccd_id (int): CCD ID
+        pixel_padding (int): Number of pixels to pad around FFI footprint (default: 50)
+        magnitude_limit (float): Magnitude limit for Gaia RP band (default: 18)
+
+    Returns:
+        str: Path to the saved catalog CSV file
+    """
+    print(f"📡 Downloading Gaia catalog for FFI with {pixel_padding} pixel padding...")
+
+    # Create output directory structure
+    catalog_dir = os.path.join(output_path, "catalogs", f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}")
+    os.makedirs(catalog_dir, exist_ok=True)
+
+    catalog_filename = f"gaia_catalog_s{sector:04d}_{camera_id}_{ccd_id}.csv"
+    catalog_path = os.path.join(catalog_dir, catalog_filename)
+
+    # Get image dimensions for the footprint calculation
+    height, width = data_shape
+
+    # Create padded corners for footprint calculation
+    # Add padding to corners (expand outward)
+    padded_corners = np.array(
+        [
+            [-pixel_padding, -pixel_padding],  # bottom-left
+            [width - 1 + pixel_padding, -pixel_padding],  # bottom-right
+            [width - 1 + pixel_padding, height - 1 + pixel_padding],  # top-right
+            [-pixel_padding, height - 1 + pixel_padding],  # top-left
+        ]
+    )
+
+    # Convert padded pixel coordinates to world coordinates
+    sky_coords = tess_wcs.pixel_to_world(padded_corners[:, 0], padded_corners[:, 1])
+
+    print(f"FFI footprint with {pixel_padding} pixel padding calculated")
+
+    # Extract RA and Dec coordinates
+    ra_coords = sky_coords.ra.deg
+    dec_coords = sky_coords.dec.deg
+
+    # Format footprint for ADQL query - interleave RA and Dec coordinates
+    footprint_coords = []
+    for ra, dec in zip(ra_coords, dec_coords):
+        footprint_coords.extend([ra, dec])
+
+    polygon_str = ",".join(map(str, footprint_coords))
+
+    # Construct a query to ONLY COUNT the stars. This is very fast.
+    count_query = f"""
+    SELECT COUNT(*)
+    FROM gaiadr3.gaia_source
+    WHERE 1=CONTAINS(
+        POINT('ICRS', ra, dec),
+        POLYGON('ICRS', {polygon_str})
+    )
+    AND phot_rp_mean_mag < {magnitude_limit}
+    """
+
+    # Launch a synchronous job to get the count.
+    try:
+        count_job = Gaia.launch_job(count_query)
+        star_count = count_job.get_results()[0][0]  # The result is a table with one row/column
+        print(f"✅ Found {star_count} stars in the padded FFI area.")
+    except Exception as e:
+        print(f"❌ ERROR: Could not query Gaia for star count. Error: {e}")
+        raise
+
+    print("📚 Downloading the full catalog with positions, magnitudes, and errors...")
+
+    # Construct the main query to get the detailed star data.
+    catalog_query = f"""
+    SELECT
+        source_id, ra, ra_error, dec, dec_error,
+        parallax, parallax_error,
+        phot_g_mean_mag,
+        phot_bp_mean_mag,
+        phot_rp_mean_mag
+    FROM
+        gaiadr3.gaia_source
+    WHERE 1=CONTAINS(
+        POINT('ICRS', ra, dec),
+        POLYGON('ICRS', {polygon_str})
+    )
+    AND phot_rp_mean_mag < {magnitude_limit}
+    """
+
+    print("Submitting job to Gaia... this may take a few minutes.")
+
+    # Use async job for large queries
+    catalog_job = Gaia.launch_job_async(catalog_query)
+    gaia_catalog = catalog_job.get_results()
+
+    # Convert to pandas DataFrame and save as CSV
+    df = gaia_catalog.to_pandas()
+    df.to_csv(catalog_path, index=False)
+
+    print(f"✅ Gaia catalog saved to: {catalog_path}")
+    print(f"📊 Downloaded {len(df)} stars")
+
+    return catalog_path
+
+
+# ============================================================================
+# GAIA CATALOG WORKFLOW FUNCTIONS
+# ============================================================================
+
+
+def download_gaia_catalog_for_tess_file(tess_file, output_path, pixel_padding=50, magnitude_limit=18.0, force_download=False):
+    """
+    Standalone function to download Gaia catalog for a TESS FITS file.
+
+    This function handles the complete workflow of loading TESS data and downloading
+    the corresponding Gaia catalog with proper file organization.
+
+    Args:
+        tess_file (str): Path to TESS FITS file
+        output_path (str): Base directory for Gaia catalogs (default: ./data/catalogs)
+        pixel_padding (int): Number of pixels to pad around FFI footprint (default: 50)
+        magnitude_limit (float): Magnitude limit for Gaia RP band (default: 18.0)
+        force_download (bool): Force download even if catalog already exists (default: False)
+
+    Returns:
+        str: Path to the downloaded catalog CSV file
+    """
+    print(f"🚀 Starting Gaia catalog download workflow for: {tess_file}")
+
+    # Load TESS data to get WCS and metadata
+    print("Loading TESS image data...")
+    data_shape, tess_wcs, ra_center, dec_center, tess_header, sector, camera_id, ccd_id = load_tess_image(tess_file)
+
+    # Create output directory structure
+    catalog_dir = os.path.join(output_path, f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}")
+    catalog_filename = f"gaia_catalog_s{sector:04d}_{camera_id}_{ccd_id}_pad{pixel_padding}_mag{magnitude_limit}.csv"
+    catalog_path = os.path.join(catalog_dir, catalog_filename)
+    catalog_path = os.path.join(catalog_dir, catalog_filename)
+
+    # Check if catalog already exists
+    if not force_download and os.path.exists(catalog_path):
+        print(f"✅ Gaia catalog already exists at: {catalog_path}")
+        return catalog_path
+
+    # Download the catalog
+    print(f"📡 Downloading Gaia catalog with {pixel_padding} pixel padding...")
+    try:
+        catalog_path = download_gaia_catalog(tess_wcs=tess_wcs, data_shape=data_shape, output_path=output_path, sector=sector, camera_id=camera_id, ccd_id=ccd_id, pixel_padding=pixel_padding, magnitude_limit=magnitude_limit)
+        print(f"✅ Gaia catalog download complete: {catalog_path}")
+        return catalog_path
+
+    except Exception as e:
+        print(f"❌ ERROR: Failed to download Gaia catalog: {e}")
+        raise
+
+
+# ============================================================================
 # MAIN PROCESSING PIPELINE
 # ============================================================================
 
@@ -1350,6 +1518,10 @@ def process_tess_image_optimized(tess_file, skycell_wcs_csv, output_path, pad_di
         tess_file (str): Path to TESS FITS file
         skycell_wcs_csv (str): Path to skycell WCS CSV file
         output_path (str): Output directory for mapping files
+        pad_distance (int): Pad distance in pixels for padding checks
+        edge_exclusion (int): Edge exclusion in pixels for padding checks
+        edge_buffer_large (int): Large edge buffer for WCS corner expansion
+        edge_buffer_small (int): Small edge buffer for WCS corner expansion
         buffer (int): Buffer size for PS1 skycells in pixels
         tess_buffer (int): Buffer size for TESS image in pixels
         n_threads (int): Number of threads for parallel processing
@@ -1493,16 +1665,31 @@ if __name__ == "__main__":
     parser.add_argument("--n_threads", type=int, default=8, help="Number of threads to use in MOC filtering")
     parser.add_argument("--max_workers", type=int, default=None, help="Max workers for ProcessPoolExecutor (default: auto)")
 
+    # Gaia catalog download options
+    parser.add_argument("--skip-download-catalog", action="store_false", help="Skip Gaia catalog download for the TESS file")
+    parser.add_argument("--gaia_catalog_dir", default="./data/catalogs", help="Base directory for Gaia catalogs")
+    parser.add_argument("--gaia_pixel_padding", type=int, default=50, help="Pixel padding around FFI for Gaia catalog download")
+    parser.add_argument("--gaia_magnitude_limit", type=float, default=18.0, help="Magnitude limit for Gaia RP band")
+    parser.add_argument("--force-gaia-download", action="store_true", help="Force Gaia catalog download even if it already exists")
+
     # Overwrite default preserved (default True). Provide flags to explicitly enable/disable.
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--overwrite", dest="overwrite", action="store_true", help="Overwrite existing output files (default)")
     group.add_argument("--no-overwrite", dest="overwrite", action="store_false", help="Do not overwrite existing output files")
-    parser.set_defaults(overwrite=True)
+    parser.set_defaults(overwrite=True, skip_download_catalog=True)
 
     args = parser.parse_args()
 
     # Ensure output directory exists
     os.makedirs(args.output_path, exist_ok=True)
+
+    # Handle Gaia catalog download if requested
+    if args.skip_download_catalog:
+        try:
+            catalog_path = download_gaia_catalog_for_tess_file(tess_file=args.tess_file, output_path=args.gaia_catalog_dir, pixel_padding=args.gaia_pixel_padding, magnitude_limit=args.gaia_magnitude_limit, force_download=args.force_gaia_download)
+        except Exception as e:
+            print(f"❌ ERROR: Failed to download Gaia catalog: {e}")
+            exit(1)
 
     # Call the processing function with parsed arguments
     results = process_tess_image_optimized(
