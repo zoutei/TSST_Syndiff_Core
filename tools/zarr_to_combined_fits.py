@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import logging
+import os
 
 # Add parent directory to path for imports
 import sys
@@ -135,6 +136,8 @@ def save_as_fits(data: np.ndarray, header: fits.Header, output_path: Path, weigh
 
         # Write to file
         hdul.writeto(output_path, overwrite=True)
+
+        os.system(f"fpack -F -Y {output_path}")
 
         logging.info(f"Successfully saved FITS file: {output_path}")
         return True
