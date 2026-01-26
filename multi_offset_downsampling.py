@@ -217,7 +217,7 @@ def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: l
                         counts[i] = len(slice_data)
 
                         # Sum only non-masked pixels
-                        sums[i] = np.sum(slice_data[~ignored_pixels])
+                        sums[i] = np.nansum(slice_data[~ignored_pixels])
 
                         # Count masked pixels for reference
                         mask_counts[i] = np.sum(slice_mask != 0)

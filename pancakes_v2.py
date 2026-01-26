@@ -1356,7 +1356,7 @@ def download_gaia_catalog(tess_wcs, data_shape, output_path, sector, camera_id, 
     print(f"📡 Downloading Gaia catalog for FFI with {pixel_padding} pixel padding...")
 
     # Create output directory structure
-    catalog_dir = os.path.join(output_path, "catalogs", f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}")
+    catalog_dir = os.path.join(output_path, f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}")
     os.makedirs(catalog_dir, exist_ok=True)
 
     catalog_filename = f"gaia_catalog_s{sector:04d}_{camera_id}_{ccd_id}.csv"
@@ -1477,7 +1477,7 @@ def download_gaia_catalog_for_tess_file(tess_file, output_path, pixel_padding=50
 
     # Create output directory structure
     catalog_dir = os.path.join(output_path, f"sector_{sector:04d}", f"camera_{camera_id}", f"ccd_{ccd_id}")
-    catalog_filename = f"gaia_catalog_s{sector:04d}_{camera_id}_{ccd_id}_pad{pixel_padding}_mag{magnitude_limit}.csv"
+    catalog_filename = f"gaia_catalog_s{sector:04d}_{camera_id}_{ccd_id}.csv"
     catalog_path = os.path.join(catalog_dir, catalog_filename)
     catalog_path = os.path.join(catalog_dir, catalog_filename)
 

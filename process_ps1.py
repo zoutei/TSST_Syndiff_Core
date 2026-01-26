@@ -28,8 +28,10 @@ import band_utils
 import convolution_utils
 import zarr_utils
 from band_utils import process_skycell_bands, remove_background
+from correct_saturation import apply_saturation_to_row
 from csv_utils import find_csv_file, get_projections_from_csv, load_csv_data
 from zarr_utils import load_skycell_bands_masks_and_headers
+from modern_padding import load_cross_projection_padding_optimized
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,28 @@ QUEUE_CHECK_INTERVAL = 20  # Log queue state every N iterations
 def calculate_total_buffer_size(cell_buffer: dict) -> int:
     """Calculate total number of cells in the buffer across all projection/row combinations."""
     return sum(len(cells) for cells in cell_buffer.values())
+
+
+def load_gaia_catalog(data_root: str, sector: int, camera: int, ccd: int, catalog_path: Optional[str] = None) -> pd.DataFrame:
+    """Load Gaia catalog for the specified sector/camera/ccd."""
+    if catalog_path is None:
+        catalog_dir = os.path.join(data_root, "catalogs", f"sector_{sector:04d}", f"camera_{camera}", f"ccd_{ccd}")
+        catalog_path = f"{catalog_dir}/gaia_catalog_s{sector:04d}_{camera}_{ccd}.csv"
+
+    if not os.path.exists(catalog_path):
+        raise FileNotFoundError(f"Catalog not found: {catalog_path}")
+
+    logger.info(f"Loading catalog from {catalog_path}")
+    catalog = pd.read_csv(catalog_path)
+
+    # Validate required columns
+    required_cols = ["ra", "dec", "phot_rp_mean_mag"]
+    missing_cols = [col for col in required_cols if col not in catalog.columns]
+    if missing_cols:
+        raise ValueError(f"Catalog missing required columns: {missing_cols}")
+
+    logger.info(f"Loaded {len(catalog)} stars from catalog")
+    return catalog
 
 
 # --- Data Structures (Retained) ---
@@ -552,7 +576,9 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
     return gathered_bundles
 
 
-def process_row_step_from_queue(state: ProcessingState, config: MasterArrayConfig, metadata: dict, current_row_id: int, next_row_id: Optional[int], combined_cell_queue: Queue, cell_buffer: dict, psf_sigma: float, zarr_path: str, projection: str) -> tuple[dict, dict]:
+def process_row_step_from_queue(
+    state: ProcessingState, config: MasterArrayConfig, metadata: dict, current_row_id: int, next_row_id: Optional[int], combined_cell_queue: Queue, cell_buffer: dict, psf_sigma: float, zarr_path: str, projection: str, catalog: Optional[pd.DataFrame] = None, enable_saturation_correction: bool = True, csv_path: Optional[str] = None, reprojection_cache: Optional[dict] = None
+) -> tuple[dict, dict]:
     """
     Encapsulates the logic for processing a single row step in the sliding window.
     It loads necessary data, applies padding, performs convolution, and extracts results.
@@ -587,21 +613,33 @@ def process_row_step_from_queue(state: ProcessingState, config: MasterArrayConfi
     # 3. Apply Cross-Row Padding
     apply_cross_row_padding(state, config)
 
-    # 4. Perform Convolution
+    # 4. Apply Cross-Projection Padding (if applicable)
+    if csv_path:
+        # Load cross-projection padding using the optimized function
+        reprojection_cache = load_cross_projection_padding_optimized(state, config, metadata, current_row_id, next_row_id, zarr_path, csv_path, reprojection_cache)
+
+    # 5. Apply Saturation Correction
+    # np.savez(f"debug_row_{current_row_id}.npz", image=state, current_row_bundles=current_row_bundles)
+    # raise RuntimeError("Debug stop")
+    if enable_saturation_correction and catalog is not None:
+         apply_saturation_to_row(state, current_row_bundles, catalog, enable_saturation_correction)
+
+    # 6. Perform Convolution
     nan_mask = np.isnan(state.current_array)
+    state.current_array[nan_mask] = 0.0
     logger.info(f"[SequentialProcessor] Applying convolution for row ID {current_row_id}")
     convolved_array = convolution_utils.apply_gaussian_convolution(state.current_array, sigma=psf_sigma)
     # Restore NaNs on the result, not the state array which will be replaced
     convolved_array[nan_mask] = np.nan
 
-    # 5. Extract and Return Results
+    # 7. Extract and Return Results
     results_data = extract_cell_results(convolved_array, state.cell_locations)
     results_masks = {name: mask for name, mask in state.current_masks.items() if name in state.cell_locations}
 
     return results_data, results_masks
 
 
-def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell_queue: Queue, results_queue: Queue, psf_sigma: float, zarr_path: str, cell_buffer: dict):
+def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell_queue: Queue, results_queue: Queue, psf_sigma: float, zarr_path: str, cell_buffer: dict, catalog: Optional[pd.DataFrame] = None, enable_saturation_correction: bool = True, csv_path: Optional[str] = None):
     """
     SPEC: This is Stage 3. It iterates through projections sequentially,
     calling a helper function to process each row, queues results, and manages
@@ -625,6 +663,9 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
                     break
             continue
 
+        # Initialize reprojection cache for this projection
+        reprojection_cache = {}
+
         # Inner Loop: Process each row
         for i, current_row_id in enumerate(row_ids):
             logger.info(f"[SequentialProcessor] --- Processing step for row {i + 1}/{len(row_ids)}: ROW ID {current_row_id} ---")
@@ -634,7 +675,7 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
             next_row_id = row_ids[i + 1] if i + 1 < len(row_ids) else None
 
             # Call the Helper Function to do the heavy lifting
-            results_data, results_masks = process_row_step_from_queue(state, config, metadata, current_row_id, next_row_id, combined_cell_queue, cell_buffer, psf_sigma, zarr_path, projection)
+            results_data, results_masks = process_row_step_from_queue(state, config, metadata, current_row_id, next_row_id, combined_cell_queue, cell_buffer, psf_sigma, zarr_path, projection, catalog, enable_saturation_correction, csv_path, reprojection_cache)
 
             # Queue the Results
             processed_bundle = {"projection": projection, "row_id": current_row_id, "results_data": results_data, "results_masks": results_masks}
@@ -654,7 +695,7 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
 # --- Main Orchestrator ---
 
 
-def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_root: str = "data", projections_limit: Optional[int] = None, psf_sigma: float = 60.0):
+def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_root: str = "data", projections_limit: Optional[int] = None, psf_sigma: float = 60.0, enable_saturation_correction: bool = True, catalog_path: Optional[str] = None):
     """The top-level master orchestrator for the entire pipeline."""
     global _child_processes
     _child_processes.clear()
@@ -674,6 +715,16 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
     except Exception as e:
         logger.error(f"[Pipeline] Failed to load configuration: {e}")
         return {"error": str(e)}
+
+    # Load catalog for saturation correction
+    catalog = None
+    if enable_saturation_correction:
+        try:
+            catalog = load_gaia_catalog(data_root, sector, camera, ccd, catalog_path)
+            logger.info(f"[Pipeline] Loaded {len(catalog)} stars from catalog")
+        except Exception as e:
+            logger.warning(f"[Pipeline] Failed to load catalog: {e}")
+            catalog = None
 
     # --- Setup ---
     zarr_store = zarr.open(zarr_path, mode="r")
@@ -722,7 +773,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
             task_queue.put(None)
 
         # --- Run Sequential Processor (Stage 3) in Main Thread ---
-        sequential_processor(projections, df, combined_cell_queue, results_queue, psf_sigma, zarr_path, cell_buffer)
+        sequential_processor(projections, df, combined_cell_queue, results_queue, psf_sigma, zarr_path, cell_buffer, catalog, enable_saturation_correction)
 
         # --- Final Shutdown Sequence ---
         logger.info("[Pipeline] Sequential processor finished. Shutting down upstream workers.")
@@ -757,17 +808,19 @@ if __name__ == "__main__":
     import argparse
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    parser = argparse.ArgumentParser(description="Modern Sliding Window PS1 Processing Pipeline")
+    parser = argparse.ArgumentParser(description="Syndiff Template PS1 Processing Pipeline")
     parser.add_argument("sector", type=int, help="TESS sector number")
     parser.add_argument("camera", type=int, help="TESS camera number")
     parser.add_argument("ccd", type=int, help="TESS CCD number")
     parser.add_argument("--data-root", default="data", help="Root data directory")
     parser.add_argument("--limit", type=int, help="Limit projections for testing")
     parser.add_argument("--psf-sigma", type=float, default=40.0, help="PSF sigma for convolution")
+    parser.add_argument("--enable-saturation-correction", action="store_true", default=False, help="Enable saturation correction")
+    parser.add_argument("--catalog-path", help="Path to Gaia catalog CSV file")
     args = parser.parse_args()
-    results = run_modern_sliding_window_pipeline(args.sector, args.camera, args.ccd, data_root=args.data_root, projections_limit=args.limit, psf_sigma=args.psf_sigma)
+    results = run_modern_sliding_window_pipeline(args.sector, args.camera, args.ccd, data_root=args.data_root, projections_limit=args.limit, psf_sigma=args.psf_sigma, enable_saturation_correction=args.enable_saturation_correction, catalog_path=args.catalog_path)
 
     if results.get("status") == "success":
-        print("\n✅ Modern sliding window pipeline completed successfully!")
+        print("\n✅ Syndiff Template PS1 processing pipeline completed successfully!")
     else:
         print(f"\n❌ Pipeline failed: {results.get('error', 'Unknown error')}")
