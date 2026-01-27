@@ -31,7 +31,7 @@ from band_utils import process_skycell_bands, remove_background
 from correct_saturation import apply_saturation_to_row
 from csv_utils import find_csv_file, get_projections_from_csv, load_csv_data
 from zarr_utils import load_skycell_bands_masks_and_headers
-from modern_padding import load_cross_projection_padding_optimized
+from cross_projection_padding import apply_cross_projection_padding
 
 logger = logging.getLogger(__name__)
 
@@ -577,7 +577,7 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
 
 
 def process_row_step_from_queue(
-    state: ProcessingState, config: MasterArrayConfig, metadata: dict, current_row_id: int, next_row_id: Optional[int], combined_cell_queue: Queue, cell_buffer: dict, psf_sigma: float, zarr_path: str, projection: str, catalog: Optional[pd.DataFrame] = None, enable_saturation_correction: bool = True, csv_path: Optional[str] = None, reprojection_cache: Optional[dict] = None
+    state: ProcessingState, config: MasterArrayConfig, metadata: dict, current_row_id: int, next_row_id: Optional[int], combined_cell_queue: Queue, cell_buffer: dict, psf_sigma: float, zarr_path: str, projection: str, catalog: Optional[pd.DataFrame] = None, enable_saturation_correction: bool = True, csv_path: Optional[str] = None
 ) -> tuple[dict, dict]:
     """
     Encapsulates the logic for processing a single row step in the sliding window.
@@ -618,9 +618,8 @@ def process_row_step_from_queue(
     apply_cross_row_padding(state, config)
 
     # 5. Apply Cross-Projection Padding (if applicable)
-    # if csv_path:
-    #     # Load cross-projection padding using the optimized function
-    #     reprojection_cache = load_cross_projection_padding_optimized(state, config, metadata, current_row_id, next_row_id, zarr_path, csv_path, reprojection_cache)
+    if csv_path:
+        apply_cross_projection_padding(state, config, metadata, current_row_id, next_row_id, zarr_path, csv_path)
 
     # np.savez(f"debug_row_{current_row_id}.npz", image=state, current_row_bundles=current_row_bundles)
     # raise RuntimeError("Debug stop")
@@ -664,9 +663,6 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
                     break
             continue
 
-        # Initialize reprojection cache for this projection
-        reprojection_cache = {}
-
         # Inner Loop: Process each row
         for i, current_row_id in enumerate(row_ids):
             logger.info(f"[SequentialProcessor] --- Processing step for row {i + 1}/{len(row_ids)}: ROW ID {current_row_id} ---")
@@ -676,7 +672,7 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
             next_row_id = row_ids[i + 1] if i + 1 < len(row_ids) else None
 
             # Call the Helper Function to do the heavy lifting
-            results_data, results_masks = process_row_step_from_queue(state, config, metadata, current_row_id, next_row_id, combined_cell_queue, cell_buffer, psf_sigma, zarr_path, projection, catalog, enable_saturation_correction, csv_path, reprojection_cache)
+            results_data, results_masks = process_row_step_from_queue(state, config, metadata, current_row_id, next_row_id, combined_cell_queue, cell_buffer, psf_sigma, zarr_path, projection, catalog, enable_saturation_correction, csv_path)
 
             # Queue the Results
             processed_bundle = {"projection": projection, "row_id": current_row_id, "results_data": results_data, "results_masks": results_masks}
