@@ -251,7 +251,7 @@ def process_single_cell(raw_bundle: dict) -> dict:
         combined_image = remove_background(combined_image, combined_uncert)
 
         # Return the processed bundle
-        combined_bundle = {"skycell_id": raw_bundle["skycell_id"], "projection": raw_bundle["projection"], "row_id": raw_bundle["row_id"], "x_coord": raw_bundle["x_coord"], "combined_image": combined_image, "combined_mask": combined_mask}
+        combined_bundle = {"skycell_id": raw_bundle["skycell_id"], "projection": raw_bundle["projection"], "row_id": raw_bundle["row_id"], "x_coord": raw_bundle["x_coord"], "combined_image": combined_image, "combined_mask": combined_mask, "headers_data": raw_bundle["headers_data"]}
 
         logger.info(f"[PreProcessor] Processed {raw_bundle['skycell_id']}")
         return combined_bundle
@@ -299,7 +299,7 @@ def pre_processor_worker(raw_cell_queue: Queue, combined_cell_queue: Queue):
             logger.info(f"[PreProcessor] Starting Source Extractor {raw_bundle['skycell_id']}")
             combined_image = remove_background(combined_image, combined_uncert)
             # SPEC: Pass essential metadata through to the assembler stage.
-            combined_bundle = {"skycell_id": raw_bundle["skycell_id"], "projection": raw_bundle["projection"], "row_id": raw_bundle["row_id"], "x_coord": raw_bundle["x_coord"], "combined_image": combined_image, "combined_mask": combined_mask}
+            combined_bundle = {"skycell_id": raw_bundle["skycell_id"], "projection": raw_bundle["projection"], "row_id": raw_bundle["row_id"], "x_coord": raw_bundle["x_coord"], "combined_image": combined_image, "combined_mask": combined_mask, "headers_data": raw_bundle["headers_data"]}
             combined_cell_queue.put(combined_bundle)
             logger.info(f"[PreProcessor] Processed {raw_bundle['skycell_id']}")
         except Exception as e:
@@ -610,19 +610,20 @@ def process_row_step_from_queue(
         state.next_row_id = None
         logger.info("[SequentialProcessor] No next row to prepare.")
 
-    # 3. Apply Cross-Row Padding
+    # 3. Apply Saturation Correction
+    if enable_saturation_correction and catalog is not None:
+        apply_saturation_to_row(state, current_row_bundles, catalog)
+ 
+    # 4. Apply Cross-Row Padding
     apply_cross_row_padding(state, config)
 
-    # 4. Apply Cross-Projection Padding (if applicable)
-    if csv_path:
-        # Load cross-projection padding using the optimized function
-        reprojection_cache = load_cross_projection_padding_optimized(state, config, metadata, current_row_id, next_row_id, zarr_path, csv_path, reprojection_cache)
+    # 5. Apply Cross-Projection Padding (if applicable)
+    # if csv_path:
+    #     # Load cross-projection padding using the optimized function
+    #     reprojection_cache = load_cross_projection_padding_optimized(state, config, metadata, current_row_id, next_row_id, zarr_path, csv_path, reprojection_cache)
 
-    # 5. Apply Saturation Correction
     # np.savez(f"debug_row_{current_row_id}.npz", image=state, current_row_bundles=current_row_bundles)
     # raise RuntimeError("Debug stop")
-    if enable_saturation_correction and catalog is not None:
-         apply_saturation_to_row(state, current_row_bundles, catalog, enable_saturation_correction)
 
     # 6. Perform Convolution
     nan_mask = np.isnan(state.current_array)

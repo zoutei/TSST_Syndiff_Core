@@ -1,418 +1,327 @@
-from astropy.io import fits
-from astropy.wcs import WCS
-from glob import glob
+import logging
+
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
-from datetime import date
 
-from scipy.optimize import minimize 
-from scipy.signal import fftconvolve
-from copy import deepcopy
-from astropy.stats import sigma_clipped_stats
-from astropy.coordinates import SkyCoord, Angle
-import astropy.units as u
-from photutils.aperture import CircularAperture
-from photutils.aperture import ApertureStats, aperture_photometry
-# from astroquery.vizier import Vizier
-# Vizier.ROW_LIMIT = -1
+from astropy.wcs import WCS
+from astropy.modeling import fitting, models
+from astropy.nddata import NDData
+from astropy.table import Table
+from photutils.psf import EPSFBuilder, extract_stars
 
-from old.tools import * #ps_psf, psf_minimizer, psf_phot, mask_rad_func
-from old.tools import _get_gaia, _get_bsc
-from timeit import default_timer as timer
+logger = logging.getLogger(__name__)
 
 
+def filter_catalog_for_region(catalog_df, wcs, x_min, x_max, y_min, y_max):
+    """
+    Filter catalog using hybrid approach: RA/DEC pre-filter + pixel conversion
 
-def image2counts(data,header,toflux=True):
-	if toflux:
-		a = 2.5/np.log(10)
-		x = data/a
-		flux = header['boffset'] + header['bsoften'] * 2 * np.sinh(x)
-		return flux
-	else:
-		a = 2.5/np.log(10)
-		tmp = (data - header['boffset']) / (header['bsoften']*2)
-		tmp = np.arcsinh(tmp)*a
-		return tmp
+    Args:
+        catalog_df: DataFrame with 'ra', 'dec', 'phot_rp_mean_mag' columns
+        wcs: WCS object from leftmost cell
+        x_min, x_max, y_min, y_max: Pixel boundaries of region
 
-def new_get_catalog(catalog, wcs, padded, band, pad = 500, ra = None, dec = None):
-	if (type(catalog) == bool):
-		cat = query_ps1(ra, dec,0.41)
-	elif catalog is not None:
-		if type(catalog) == str:
-			cat = pd.read_csv(catalog)
-		else:
-			cat = catalog
-	else:
-		return 
-	
-	x,y = wcs.all_world2pix(cat['raMean'].values,cat['decMean'].values,0)
-	x += pad; y += pad
-	cat['x'] = x
-	cat['y'] = y
-	ind = (x > 0) & (y > 0) & (x < padded.shape[1]) & (y < padded.shape[0])
-	cat = cat.iloc[ind]
-	cat = cat.loc[(cat['iMeanPSFMag'] > 0) & (cat['rMeanPSFMag'] > 0) & 
-					(cat['zMeanPSFMag'] > 0) & (cat['yMeanPSFMag'] > 0)]
-	cat = cat.sort_values(band+'MeanPSFMag')
-	cat = cat.drop_duplicates()
-	return cat
+    Returns:
+        DataFrame with x, y, phot_rp_mean_mag columns for stars in region
+    """
 
-class saturated_stars():
-	def __init__(self,ps1,catalog_ps1=None,catalogpath=None,mask=True,
-				 satlim=None,calmags=[15,17],run=True,overwrite=False):
-		"""
-		"""
-		start = timer()
-		self.ps1 = ps1 
-		self.band = ps1.band
-		self.wcs = ps1.wcs
-		# self._load_ps1(mask)
-		self.padded_skycell = ps1.padded
-		#self.savepath = savepath
-		self.overwrite = overwrite
-		#if self._check_exist():
-		self._set_satlim(satlim)
-		self.calmags = calmags
-		prelim = timer() - start
-		#print('prelim ',prelim)
-		self.sort_cats(catalog_ps1,catalogpath)
-		#cats = timer() - prelim
-		#print('cats ',cats)
-		if run:
-			self.fit_psf()
-			#psf = timer() - cats
-			#print('psf ',cats)
-			self.flux_offset()
-			#offset = timer() - psf
-			#print('offset ',offset)
-			self.kill_saturation()
-			self.replace_saturation()
-			#replace = timer() - offset
-			#print('replace ',replace)
-			self._update_image()
-			#uimage = timer() - replace
-			#print('update image ',uimage)
-			self._update_mask()
-			#umask = timer() - uimage
-			#print('update mask ',umask)
-				#if self.ps1.mask is not None:
-				#	self._save_mask()
+    # Step 1: RA/DEC pre-filter (fast rejection)
+    try:
+        # Use separate x, y arrays instead of coordinate pairs to avoid confusion
+        corners_x = np.array([x_min, x_max, x_min, x_max])
+        corners_y = np.array([y_min, y_min, y_max, y_max])
+        
+        # Validate WCS is celestial
+        if not wcs.is_celestial:
+            logger.warning("WCS is not celestial, skipping catalog filtering")
+            return catalog_df.iloc[0:0].copy()
+
+        # Use low-level API to avoid SkyCoord dimension issues
+        ra_bounds, dec_bounds = wcs.all_pix2world(corners_x, corners_y, 0)
+        
+        # Check if coordinates are valid
+        if not np.all(np.isfinite(ra_bounds)) or not np.all(np.isfinite(dec_bounds)):
+            logger.warning("Invalid pixel coordinates for WCS transformation")
+            return catalog_df.iloc[0:0].copy()  # Return empty DataFrame
+
+        # Calculate bounds from all 4 corners
+        ra_min, ra_max = ra_bounds.min(), ra_bounds.max()
+        dec_min, dec_max = dec_bounds.min(), dec_bounds.max()
+
+    except Exception as e:
+        logger.warning(f"WCS transformation failed: {e}")
+        return catalog_df.iloc[0:0].copy()  # Return empty DataFrame
+
+    pre_filter = (catalog_df["ra"] >= ra_min) & (catalog_df["ra"] <= ra_max) & (catalog_df["dec"] >= dec_min) & (catalog_df["dec"] <= dec_max)
+
+    if pre_filter.sum() == 0:
+        return catalog_df.iloc[0:0].copy()  # Return empty DataFrame with same structure
+
+    # Step 2: Convert pre-filtered stars to pixels
+    pre_filtered = catalog_df[pre_filter]
+    star_coords = wcs.all_world2pix(pre_filtered["ra"], pre_filtered["dec"], 0)
+
+    # Step 3: Final pixel boundary filter
+    pixel_filter = (star_coords[0] >= x_min) & (star_coords[0] < x_max) & (star_coords[1] >= y_min) & (star_coords[1] < y_max)
+
+    if pixel_filter.sum() == 0:
+        return catalog_df.iloc[0:0].copy()  # Return empty DataFrame with same structure
+
+    # Step 4: Return formatted DataFrame
+    result = pre_filtered[pixel_filter].copy()
+    result["x"] = star_coords[0][pixel_filter]
+    result["y"] = star_coords[1][pixel_filter]
+    return result[["x", "y", "phot_rp_mean_mag"]]
 
 
+def replace_saturated_stars(data_array, mask_array, num_chunks, catalog, max_mag_replace=14.0, mag_threshold_epsf=15, min_mag_epsf=13.5, max_mag_epsf=17.0, star_half_size: int = 25, mask_bit_index: int = 5):
+    """
+    Replace saturated stars in a large image array by fitting an effective PSF (ePSF) built from unsaturated stars.
 
-	def _check_exist(self):
-		savename = self.savepath + self.file.split('fits')[0].split('/')[-1] + 'satcor.fits'
-		run = True
-		try:
-			hdu = fits.open(savename)
-			hdu.close()
-			if ~self.overwrite:
-				run = False
-				print('File exists')
-			else:
-				print('Overwriting file')
-		except:
-			pass
-		return run
+    Parameters:
+    - data_array (np.ndarray): The large image data array (e.g., 7000x70000).
+    - mask_array (np.ndarray): The corresponding mask array, where True indicates bad/masked pixels.
+    - num_chunks (int): Number of chunks to divide the array into along the x-axis for processing.
+    - catalog (pd.DataFrame): Star catalog with columns 'x', 'y', 'phot_rp_mean_mag'.
+    - max_mag_replace (float): Maximum magnitude for stars to be replaced (default 13.5).
+    - mag_threshold_epsf (float): Magnitude threshold for masking saturated pixels during ePSF fitting (default 15).
+    - min_mag_epsf (float): Minimum magnitude for stars used in ePSF building (default 14).
+    - max_mag_epsf (float): Maximum magnitude for stars used in ePSF building (default 18.0).
+    - star_half_size (int): Half-size of the cutout for star fitting (default 25).
+    - mask_bit_index (int): Bit index to set in the mask for replaced pixels (default 0).
 
-	def _load_ps1(self,mask):
-		if type(self.ps1) == str:
-			self.ps1 = ps1_data(self.ps1,mask=mask)
-		# self.ps1.convert_flux_scale(toflux=True)
+    Returns:
+    None: Modifies data_array and mask_array in place.
+    """
+    height, width = data_array.shape
+    chunk_width = width // num_chunks
 
-	def _set_satlim(self,satlim):
-		if satlim is None:
-			offset = 0
-			given = {'g':14.5-offset,'r':15-offset,'i':15-offset,'z':14-offset,'y':13-offset}
-			self.satlim = given[self.band]
-		else:
-			self.satlim = satlim
+    for i in range(num_chunks):
+        start_x = i * chunk_width
+        end_x = (i + 1) * chunk_width if i < num_chunks - 1 else width
 
+        # Find stars in this chunk
+        stars_in_chunk = catalog[(catalog["x"] >= start_x) & (catalog["x"] < end_x)]
 
-	def _get_catalog(self,catalog_ps1=None):
-		
-		# self.ps1cat = pd.read_csv(catalog_ps1)
-     
-		# self.ps1.get_catalog(catalog_ps1)
-		# cat = new_get_catalog(catalog_ps1, wcs, pad, self.padded_skycell)
-		cat = new_get_catalog(catalog_ps1, self.wcs, self.padded_skycell, self.band, pad = 500, ra = None, dec = None)
-  
-		if len(cat) < 1:
-			# print(cat)
-			print('ZZZ No catalog found, using PS1 catalog')
-			print('ZZZ catalog_ps1:', catalog_ps1, type(catalog_ps1))
-  
-		# print('PS1 catalog loaded with',len(self.ps1.cat),'sources', type(self.ps1.cat))
+        # Stars for ePSF building (unsaturated)
+        good_stars = stars_in_chunk[(stars_in_chunk["phot_rp_mean_mag"] > min_mag_epsf) & (stars_in_chunk["phot_rp_mean_mag"] < max_mag_epsf)]
 
-		self.ps1cat = deepcopy(cat)
-		self.ps1satcat = deepcopy(self.ps1cat.loc[self.ps1cat[self.band+'MeanPSFMag'] < self.satlim])
-		self.calcat = deepcopy(self.ps1cat.loc[(self.ps1cat[self.band+'MeanPSFMag'] > self.calmags[0]) & (self.ps1cat[self.band+'MeanPSFMag'] < self.calmags[1])])
+        # Saturated stars to replace
+        sat_stars = stars_in_chunk[stars_in_chunk["phot_rp_mean_mag"] <= max_mag_replace]
 
-	def _get_vizier_cats(self,catalogpath=None):
-		if catalogpath is None:
-			sc = SkyCoord(self.ps1.ra,self.ps1.dec, frame='icrs', unit='deg')
-			gaia = _get_gaia(sc,0.41)
-			bsc = _get_bsc(sc,0.41)
-			#tyco = _get_tyco(sc,0.8)
-		else:
-			try:
-				gaia = pd.read_csv(catalogpath+'_gaia.csv')
-			except:
-				gaia = None
-    
-			try:
-   				bsc = pd.read_csv(catalogpath+'_bsc.csv')
-			except:
-				bsc = None
-			#tyco = pd.read_csv(catalogpath+'tyco.csv')
-		if gaia is not None:
-			x,y = self.ps1.wcs.all_world2pix(gaia.RA_ICRS.values,gaia.DE_ICRS.values,0)
-			x += self.ps1.pad; y += self.ps1.pad
-			gaia['x'] = x; gaia['y'] = y
-			ind = (x > 5) & (x < self.padded_skycell.shape[1]-5) & (y > 5) & (y < self.padded_skycell.shape[0]-5) # should change this to oversize
-			self.gaiacat = gaia.iloc[ind]
-		else:
-			self.gaiacat = None
-		if bsc is not None:
-			x,y = self.ps1.wcs.all_world2pix(bsc.RA_ICRS.values,bsc.DE_ICRS.values,0)
-			x += self.ps1.pad; y += self.ps1.pad
-			bsc['x'] = x; bsc['y'] = y
-			ind = (x > 5) & (x < self.padded_skycell.shape[1]-5) & (y > 5) & (y < self.padded_skycell.shape[0]-5) # should change this to oversize
-			self.bsccat = bsc.iloc[ind]
-		else:
-			self.bsccat = None
+        if len(good_stars) == 0:
+            logger.warning(f"No good stars in chunk {i}, skipping.")
+            continue
 
-		#if tyco is not None:
-		#	x,y = self.ps1.wcs.all_world2pix(tyco.RA_ICRS.values,tyco.DE_ICRS.values,0)
-		#	tyco['x'] = x; tyco['y'] = y
-		#	ind = (x > 5) & (x < self.padded_skycell.shape[1]-5) & (y > 5) & (y < self.padded_skycell.shape[0]-5) # should change this to oversize
-		#	self.tycocat = tyco.iloc[ind]
-		#else:
-		#	self.tycocat = None
+        # Shift coordinates to local (relative to sub_data)
+        logger.info(f"Chunk {i}: {len(good_stars['x'])} good stars after bounds filtering. {len(sat_stars)} saturated stars")
 
+        # Prepare data for ePSF extraction
+        mask_for_epsf = ~np.isfinite(data_array)  # | sub_mask
+        data_nd = NDData(data_array, mask=mask_for_epsf)
+        positions = Table()
+        positions["x"] = good_stars["x"]
+        positions["y"] = good_stars["y"]
 
-	def _get_atlas_refcat(self,replace_ps1=True):
-		cat = search_refcat(self.ps1.ra,self.ps1.dec,0.4)
-		if replace_ps1:
-			offset = 0
-			given = {'g':14.5-offset,'r':15-offset,'i':15-offset,'z':14-offset,'y':13-offset}
-			bands = ['r','i','z']
-			for ind in cat['objid'].values:
-				row = cat.loc[cat['objid'] == ind]
-				if len(self.ps1cat.loc[self.ps1cat['objID']==ind]) > 0:
-					for band in bands:
-						self.ps1cat[band+'PSFMeanMag'].loc[self.ps1cat['objID']==ind] = row[band]
-				else:
-					r = deepcopy(self.ps1cat)
+        # Extract stars for ePSF
+        try:
+            stars_tbl = extract_stars(data_nd, positions, size=star_half_size * 2 + 1)
+            if len(stars_tbl) == 0:
+                logger.warning(f"No stars extracted in chunk {i}, skipping.")
+                continue
+        except Exception as e:
+            logger.warning(f"Error extracting stars in chunk {i}: {e}")
+            continue
 
-				
-	def _kill_cat(self):
-		kill_cat = None
-		if self.gaiacat is not None:
-			ugaia = find_unique2ps1(self.ps1cat,self.gaiacat, self.ps1.temp_catalog)
-   
-			if ugaia is None:
-				print(self.ps1cat)
+        # Build ePSF
+        epsf_builder = EPSFBuilder(oversampling=2, maxiters=3, progress_bar=False)
+        try:
+            epsf, _ = epsf_builder(stars_tbl)
+        except Exception as e:
+            logger.warning(f"Error building ePSF in chunk {i}: {e}")
+            continue
+        logger.info("epsf built")
 
-			kill_cat = ugaia[['x','y','Gmag']]
-			kill_cat = kill_cat.rename(columns={'Gmag':'mag'})
-		if self.bsccat is not None:
-			ubsc = find_unique2viz(self.gaiacat,self.bsccat)
-			ubsc = ubsc[['x','y','Vmag']]
-			ubsc = ubsc.rename(columns={'Vmag':'mag'})
-			kill_cat = pd.concat([kill_cat,ubsc])
+        # Process each saturated star
+        for idx, star in sat_stars.iterrows():
+            global_x = star["x"]
+            global_y = star["y"]
 
-		if kill_cat is not None:
-			kill_cat = combine_close_sources(kill_cat)
-		self.kill_cat = kill_cat
+            # Skip stars too close to the edge
+            if global_y < star_half_size or global_y >= height - star_half_size or global_x < star_half_size or global_x >= width - star_half_size:
+                continue
 
+            # Define cutout size (51x51 centered on star) from the full data_array
+            y_start = max(0, int(global_y) - star_half_size)
+            y_end = min(data_array.shape[0], int(global_y) + star_half_size + 1)
+            x_start = max(0, int(global_x) - star_half_size)
+            x_end = min(data_array.shape[1], int(global_x) + star_half_size + 1)
 
-	def sort_cats(self,catalog_ps1,catalogpath):
-		self._get_catalog(catalog_ps1)
-		self._get_vizier_cats(catalogpath)
-		self._kill_cat()
-		
+            cutout = data_array[y_start:y_end, x_start:x_end]
+            cutout_mask_local = mask_array[y_start:y_end, x_start:x_end]
+
+            # Mask for fitting: finite, not already masked, below threshold
+            # Convert magnitude threshold to flux threshold
+            flux_threshold = 10 ** ((mag_threshold_epsf - 25) / -2.5) * epsf.data.max()
+            fit_mask = np.isfinite(cutout) & ~cutout_mask_local & (cutout < flux_threshold)
+
+            if not np.any(fit_mask):
+                logger.warning(f"No valid pixels for fitting star at ({global_x}, {global_y}) in chunk {i}")
+                continue
+
+            # Model: ePSF + constant background
+            mag = star["phot_rp_mean_mag"]
+            flux_guess = 10 ** ((25 - mag) / 2.5)
+            psf_model = epsf.copy()
+            psf_model.flux = flux_guess
+            psf_model.x_0 = cutout.shape[1] // 2
+            psf_model.y_0 = cutout.shape[0] // 2
+            background = models.Const2D(amplitude=0.0)
+            model = psf_model + background
+
+            # Coordinate grids
+            y_coords, x_coords = np.mgrid[: cutout.shape[0], : cutout.shape[1]]
+
+            # Fit the model
+            fitter = fitting.LevMarLSQFitter()
+            try:
+                fitted_model = fitter(model, x_coords, y_coords, cutout, weights=fit_mask.astype(float), filter_non_finite=True)
+            except Exception as e:
+                logger.warning(f"Error fitting star at ({global_x}, {global_y}) in chunk {i}: {e}")
+                continue
+
+            # Generate fitted image
+            fitted_image = fitted_model(x_coords, y_coords)
+
+            saturated_pixels = cutout > flux_threshold
+
+            data_array[y_start:y_end, x_start:x_end][saturated_pixels] = fitted_image[saturated_pixels]
+
+            mask_array[y_start:y_end, x_start:x_end][saturated_pixels] |= 1 << mask_bit_index
+
+        logger.info(f"Processed chunk {i}: replaced {len(sat_stars)} stars.")
 
 
+def filter_catalog_for_row(catalog_df: pd.DataFrame, cell_positions: dict, wcs) -> pd.DataFrame:
+    """Filter catalog to stars within actual data regions only."""
+    if not cell_positions:
+        return pd.DataFrame()
 
-	def fit_psf(self,size=15):
-		cal = self.calcat
-		psf_mod = []
-		if len(cal) > 30:
-			r = 30
-		else:
-			r = len(cal)
-		for j in range(r):
-			cut, x, y = self._create_cut(cal.iloc[j],size)
-			x0 = [10,10,0,1,0,0]
-			res = minimize(psf_minimizer,x0,args=(cut,x,y))
-			psf_mod += [res.x]
-		psf_mod = np.array(psf_mod)
-		psf_param = np.nanmedian(psf_mod,axis=0)
-		self.psf_param = psf_param
+    # Get actual data boundaries from cell_positions
+    data_x_min = min(pos[0] for pos in cell_positions.values())
+    data_x_max = max(pos[1] for pos in cell_positions.values())
+    data_y_min = min(pos[2] for pos in cell_positions.values())
+    data_y_max = max(pos[3] for pos in cell_positions.values())
 
-	def flux_offset(self,size=15,psf=False):
-		cal = self.calcat
-		if psf:
-			fit_flux = []
-			for j in range(len(cal)):
-				cut, x, y = self._create_cut(cal.iloc[j],size)
-				psf = ps_psf(self.psf_param[:-2],x-self.psf_param[-2],y-self.psf_param[-1])
-				cflux = 10**((cal[self.band+'MeanPSFMag'].values[j]-25)/-2.5)
-				f = minimize(psf_phot,cflux,args=(cut,psf))
-				fit_flux += [f.x]
-			fit_flux = np.array(fit_flux)
-		else:
-			pos = list(zip(cal.x.values, cal.y.values))
-			aperture = CircularAperture(pos, 20)
-			m,med,std = sigma_clipped_stats(self.padded_skycell)
-			origphot = aperture_photometry(self.padded_skycell-med, aperture)
-			fit_flux = origphot['aperture_sum'].value
-		factor = np.nanmedian(fit_flux / 10**((cal[self.band+'MeanPSFMag'].values-25)/-2.5))
-		self.flux_factor = factor
-		self._fitflux = fit_flux
+    # Convert RA/DEC to pixel coordinates
+    from astropy.coordinates import SkyCoord
 
-	def _create_cut(self,source,size):
-		xx = source['x']; yy = source['y']
-		yint = int(yy+0.5)
-		xint = int(xx+0.5)
-		cut = deepcopy(self.padded_skycell[yint-size:yint+size+1,xint-size:xint+size+1])
-		y, x = np.mgrid[:cut.shape[0], :cut.shape[1]]
-		x = x - cut.shape[1] / 2 - (xx-xint)
-		y = y - cut.shape[0] / 2 - (yy-yint)
-		return cut,x,y
+    coords = SkyCoord(catalog_df["ra"], catalog_df["dec"], unit="deg")
+    x_pixels, y_pixels = wcs.world_to_pixel(coords)
 
-	def kill_saturation(self):
-		masking = deepcopy(self.padded_skycell)
-		if self.ps1.mask is not None:
-			masking[self.ps1.mask>0] = self.ps1.image_stats[1]
-			masking[np.isnan(masking)] = self.ps1.image_stats[1]
-			self.newmask = np.isnan(masking)
-		if self.kill_cat is not None:
-			sat = self.kill_cat
-			rads = mask_rad_func(sat['mag'].values)
-			for i in range(len(sat)):
-				rad = rads[i]
-				y,x = np.mgrid[:rad*2,:rad*2]
-				
-				xx = sat['x'].values[i]; yy = sat['y'].values[i]
-				dist = np.sqrt(((x-rad))**2 + ((y-rad))**2)
-				ind = np.array(np.where(dist < rad))
-				ind[0] += int(yy) - rad
-				ind[1] += int(xx) - rad
-				good = (ind[0] >= 0) & (ind[1] >= 0) & (ind[0] < self.padded_skycell.shape[0]) & (ind[1] < self.padded_skycell.shape[1])
-				ind = ind[:,good]
-				masking[ind[0],ind[1]] = np.nan
-		self.masking = masking
-			
+    # Filter to stars within data boundaries
+    valid_mask = (x_pixels >= data_x_min) & (x_pixels < data_x_max) & (y_pixels >= data_y_min) & (y_pixels < data_y_max)
+
+    # Create filtered catalog with required columns
+    filtered = catalog_df[valid_mask].copy()
+    filtered["x"] = x_pixels[valid_mask]
+    filtered["y"] = y_pixels[valid_mask]
+
+    return filtered[["x", "y", "phot_rp_mean_mag"]]
 
 
-	def replace_saturation(self):
-		masking = deepcopy(self.masking)
-		inject = np.zeros_like(self.padded_skycell)
-		sat = self.ps1satcat
-		live = np.isfinite(masking[sat['y'].values.astype(int),sat['x'].values.astype(int)])
-		sat = sat.iloc[live]
-		rads = mask_rad_func(sat[self.band+'MeanPSFMag'].values)
-		r2 = (rads * 2.5).astype(int)
-		suspect = np.zeros_like(masking,dtype=int)
-		cfluxes = 10**((sat[self.ps1.band+'MeanPSFMag'].values-25)/-2.5)
-		for i in range(len(sat)):
-			xx = sat['x'].values[i]; yy = sat['y'].values[i]
-			#val = killed[int(yy),int(xx)]
-			#if np.isfinite(val):
-			rad = rads[i]
-			cflux = cfluxes[i]
-			y,x = np.mgrid[:rad*2,:rad*2]
-			psf = ps_psf(self.psf_param[:-2],x-self.psf_param[-2]-rad,y-self.psf_param[-1]-rad)
-			
-			xx = sat['x'].values[i]; yy = sat['y'].values[i]
-			dist = np.sqrt(((x-rad))**2 + ((y-rad))**2)
-			ind = np.array(np.where(dist < rad))
-			ind[0] += int(yy) - rad
-			ind[1] += int(xx) - rad
-			#print(np.nansum(psf[ind[0]-min(ind[0]),ind[1]-min(ind[1])]))
-			#psf /= np.nansum(psf[ind[0]-min(ind[0]),ind[1]-min(ind[1])])
-			dx = min(ind[1])
-			dy = min(ind[0])
-			good = (ind[0] >= 0) & (ind[1] >= 0) & (ind[0] < self.padded_skycell.shape[0]) & (ind[1] < self.padded_skycell.shape[1])
-			ind = ind[:,good]
-			masking[ind[0],ind[1]] = np.nan
-			inject[ind[0],ind[1]] += psf[ind[0]-dy,ind[1]-dx] * cflux * self.flux_factor + self.ps1.image_stats[1]
+def clear_sat_flags(mask_array: np.ndarray) -> None:
+    """Clear bit 5 (SAT flag) from all pixels in the mask array."""
+    sat_bit = 1 << 5  # Bit 5 = 32
+    # Use numpy bitwise_not to ensure we stay in uint32 domain if passed array is uint32, 
+    # but here we operate with a scalar. ~np.uint32(sat_bit) gives a large positive integer.
+    mask_array &= ~np.uint32(sat_bit)
 
-			y,x = np.mgrid[:r2[i]*2,:r2[i]*2]
-			dist = np.sqrt(((x-r2[i]))**2 + ((y-r2[i]))**2)
-			ind = np.array(np.where(dist < r2[i]))
-			ind[0] += int(yy) - r2[i]
-			ind[1] += int(xx) - r2[i]
-			good = (ind[0] >= 0) & (ind[1] >= 0) & (ind[0] < self.padded_skycell.shape[0]) & (ind[1] < self.padded_skycell.shape[1])
-			ind = ind[:,good]
-			suspect[ind[0],ind[1]] = 0x0080
-			#inject[ind[0],ind[1]] += psf[ind[0]-dy,ind[1]-dx] + self.ps1.image_stats[1]
-		if self.ps1.mask is not None:
-			#masking[self.ps1.mask>0] = self.ps1.image_stats[1] # set to the median
-			self.newmask = (self.newmask + (inject > 0)) > 0
-			self.suspect = suspect
-		replaced = np.nansum([masking,inject],axis=0)
-		replaced[replaced == 0] = self.ps1.image_stats[1]
-		self.replaced = replaced
-		self.inject = inject
 
-	def _update_image(self):
-		newheader = deepcopy(self.ps1.header)
-		newheader['SATCOR'] = (True,'Corrected sat stars')
-		newheader['SATDATE'] = (date.today().isoformat(),'Date of correction')
-		self.ps1.header = newheader
-		self.padded_skycell = self.replaced
+def apply_saturation_to_row(state, cell_bundles, catalog_df):
+    """
+    Complete saturation correction for one row - simplified single function
 
-	def _update_mask(self):
-		if self.ps1.mask is not None:
-			newheader = deepcopy(self.ps1.mask_header)
-			newheader['SATCOR'] = (True,'Corrected sat stars')
-			newheader['SATDATE'] = (date.today().isoformat(),'Date of correction')
-			m = deepcopy(self.newmask).astype(int)
-			m[m > 0] = 0x0020
+    Args:
+        state: ProcessingState object with current_array and current_masks
+        cell_bundles: List of cell bundles for this row
+        catalog_df: Pre-loaded catalog DataFrame
+    """
+    try:
+        # 1. Extract WCS from leftmost cell
+        leftmost = min(cell_bundles, key=lambda b: b["x_coord"])
+        wcs = None
+        try:
+            wcs = WCS(leftmost["headers_data"]['i'])
+            if wcs.naxis > 2:
+                wcs = wcs.celestial
+        except Exception:
+            logger.warning("Failed to extract WCS from leftmost cell")
 
-			self.ps1.mask = self.ps1.mask.astype(int)  # or np.uint32, depending on the bit size needed
-			m = m.astype(int)  # or np.uint32
-			# print('ZZZ Masking shape', m.shape, type(m))
-			data = self.ps1.mask | m
-			#self.suspect[self.suspect] = 0x0080
-			data = data | self.suspect
-			self.ps1.mask = data
-			self.ps1.mask_header = newheader
+        # 2. Get data boundaries and extract region
+        positions = state.cell_locations
+        if not positions:
+            return
+        num_cells = len(positions)
 
-	def plot_flux_correction(self):
-		plt.figure()
-		plt.semilogy(self.calcat[self.band+'MeanPSFMag'],self._fitflux,'.',label='Image flux')
-		plt.plot(self.calcat[self.band+'MeanPSFMag'],10**((self.calcat[self.band+'MeanPSFMag'].values-25)/-2.5)*self.flux_factor,label='Corrected catalog flux')
-		plt.xlabel(self.band+' mag',fontsize=15)
-		plt.ylabel('Counts',fontsize=15)
-		plt.legend()
-		plt.title('Correction: ' + str(np.round(self.flux_factor,2))+rf'$f_{self.band}$')
+        x_min = min(pos[0] for pos in positions.values())
+        x_max = max(pos[1] for pos in positions.values())
+        y_min = min(pos[2] for pos in positions.values())
+        y_max = max(pos[3] for pos in positions.values())
 
-	def plot_result(self):
-		vmin=np.nanpercentile(self.replaced,16)
-		vmax=np.nanpercentile(self.replaced,90)
-		plt.figure(figsize=(8,4))
-		plt.subplot(132)
-		plt.title('PS1 image')
-		plt.imshow(self.padded_skycell,vmax=vmax,vmin=vmin,origin='lower')
-		plt.plot(self.ps1satcat['x'].values,self.ps1satcat['y'].values,'C1+')
-		if self.kill_cat is not None:
-			plt.plot(self.kill_cat['x'].values,self.kill_cat['y'].values,'C3x')
-		plt.subplot(131)
-		plt.title('Injected sources')
-		plt.imshow(self.inject,vmax=vmax,vmin=vmin,origin='lower')
-		plt.plot(self.ps1satcat['x'].values,self.ps1satcat['y'].values,'C1+',label='PS1 catalog')
-		if self.kill_cat is not None:
-			plt.plot(self.kill_cat['x'].values,self.kill_cat['y'].values,'C3x',label='Gaia + BSC')
-		plt.legend(loc='lower left')
-		plt.subplot(133)
-		plt.title('Source replaced')
-		plt.imshow(self.replaced,vmax=vmax,vmin=vmin,origin='lower')
-		plt.plot(self.ps1satcat['x'].values,self.ps1satcat['y'].values,'C1+',label='PS1 catalog')
-		if self.kill_cat is not None:
-			plt.plot(self.kill_cat['x'].values,self.kill_cat['y'].values,'C3x',label='Gaia + BSC')
-		plt.tight_layout()
+        # Extract data region
+        data_region = state.current_array[y_min:y_max, x_min:x_max]
+
+        # Handle mask - create unified mask if needed
+        if hasattr(state, "current_masks") and state.current_masks:
+            # Create unified mask from cell masks
+            mask_region = np.zeros((y_max - y_min, x_max - x_min), dtype=np.uint32)
+            for cell_name, cell_mask in state.current_masks.items():
+                if cell_name in positions and isinstance(cell_mask, np.ndarray):
+                    # Map cell mask to unified mask position
+                    cell_pos = positions[cell_name]
+                    cell_x_start = cell_pos[0] - x_min
+                    cell_x_end = cell_pos[1] - x_min
+                    cell_y_start = cell_pos[2] - y_min
+                    cell_y_end = cell_pos[3] - y_min
+
+                    # Ensure bounds are valid
+                    if cell_x_end > cell_x_start and cell_y_end > cell_y_start and cell_x_start >= 0 and cell_y_start >= 0 and cell_x_end <= mask_region.shape[1] and cell_y_end <= mask_region.shape[0]:
+                        mask_region[cell_y_start:cell_y_end, cell_x_start:cell_x_end] = cell_mask
+        else:
+            # Create empty mask if no masks available
+            mask_region = np.zeros_like(data_region, dtype=np.uint32)
+
+        # 3. Filter catalog for this region
+        region_catalog = filter_catalog_for_region(catalog_df, wcs, 0, data_region.shape[1], 0, data_region.shape[0])
+
+        if len(region_catalog) == 0:
+            logger.info("No stars in region for saturation correction")
+            return
+
+        # 4. Clear SAT flags and apply correction
+        clear_sat_flags(mask_region)
+
+        replace_saturated_stars(data_array=data_region, mask_array=mask_region, num_chunks=num_cells, catalog=region_catalog, mask_bit_index=5)
+
+        # 5. Put results back into main array
+        state.current_array[y_min:y_max, x_min:x_max] = data_region
+
+        # Update mask in state if it exists
+        if hasattr(state, "current_masks") and state.current_masks:
+            # Update the unified mask back to individual cell masks
+            for cell_name, cell_mask in state.current_masks.items():
+                if cell_name in positions and isinstance(cell_mask, np.ndarray):
+                    cell_pos = positions[cell_name]
+                    cell_x_start = cell_pos[0] - x_min
+                    cell_x_end = cell_pos[1] - x_min
+                    cell_y_start = cell_pos[2] - y_min
+                    cell_y_end = cell_pos[3] - y_min
+
+                    if cell_x_end > cell_x_start and cell_y_end > cell_y_start and cell_x_start >= 0 and cell_y_start >= 0 and cell_x_end <= mask_region.shape[1] and cell_y_end <= mask_region.shape[0]:
+                        cell_mask[:] = mask_region[cell_y_start:cell_y_end, cell_x_start:cell_x_end]
+
+        logger.info(f"Applied saturation correction to {len(region_catalog)} stars")
+
+    except Exception as e:
+        logger.warning(f"Saturation correction failed: {e}")
