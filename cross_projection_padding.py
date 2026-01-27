@@ -88,6 +88,35 @@ def analyze_cell_positions(row_cells: List[str]) -> Dict[str, str]:
     return positions
 
 
+
+def _get_cd_matrix(row: pd.Series) -> List[List[float]]:
+    """Helper to extract CD matrix from row, handling CD vs CDELT/PC."""
+    # Try explicit CD matrix first
+    if "CD1_1" in row:
+        return [
+            [float(row.get(f"CD{i}_{j}", 0.0)) for j in [1, 2]] 
+            for i in [1, 2]
+        ]
+    
+    # Try CDELT + PC
+    # Default PC is identity if missing, but usually present if CDELT is present
+    if "CDELT1" in row:
+        cdelt = [float(row.get(f"CDELT{i}", 1.0)) for i in [1, 2]]
+        pc = [
+            [float(row.get(f"PC{i}_{j}", 0.0 if i != j else 1.0)) for j in [1, 2]]
+            for i in [1, 2]
+        ]
+        # CD_ij = CDELT_i * PC_ij
+        cd = [
+            [cdelt[i-1] * pc[i-1][j-1] for j in [1, 2]]
+            for i in [1, 2]
+        ]
+        return cd
+
+    # Fallback to default (approx 1 arcsec/pixel, flipped RA)
+    return [[-1.0/3600, 0.0], [0.0, 1.0/3600]]
+
+
 def create_cell_wcs(cell_name: str, metadata: dict) -> WCS:
     """Create WCS object for a specific cell from metadata."""
     proj_df = metadata["dataframe"]
@@ -101,12 +130,8 @@ def create_cell_wcs(cell_name: str, metadata: dict) -> WCS:
     # Extract WCS parameters
     crval = [float(cell_data.get(f"CRVAL{i}", 0.0)) for i in [1, 2]]
     crpix = [float(cell_data.get(f"CRPIX{i}", 0.0)) for i in [1, 2]]
-    cd = [[float(cell_data.get(f"CD{i}_{j}", 0.0)) for j in [1, 2]] for i in [1, 2]]
     
-    # Defaults for CD matrix if missing/zero (though unusual for valid WCS)
-    if cd[0][0] == 0 and cd[1][1] == 0:
-         cd[0][0] = -1.0 / 3600
-         cd[1][1] = 1.0 / 3600
+    cd = _get_cd_matrix(cell_data)
 
     wcs = WCS(naxis=2)
     wcs.wcs.crval = crval
@@ -168,8 +193,11 @@ def create_padding_wcs(master_wcs: WCS, config, location: str, cell_index: int) 
     padding_wcs.wcs.crpix = [padding_width / 2, padding_height / 2]
     padding_wcs.wcs.crval = [padding_center_world.ra.degree, padding_center_world.dec.degree]
     padding_wcs.wcs.ctype = master_wcs.wcs.ctype
-    padding_wcs.wcs.pc = master_wcs.wcs.pc.copy()
-    padding_wcs.wcs.cdelt = master_wcs.wcs.cdelt.copy()
+    if master_wcs.wcs.has_cd():
+        padding_wcs.wcs.cd = master_wcs.wcs.cd.copy()
+    else:
+        padding_wcs.wcs.pc = master_wcs.wcs.pc.copy()
+        padding_wcs.wcs.cdelt = master_wcs.wcs.cdelt.copy()
     
     return padding_wcs, (int(padding_height), int(padding_width)), (padding_y_center, padding_x_center)
 
@@ -226,16 +254,14 @@ def create_master_array_wcs(metadata: dict, config, current_row_id: int) -> WCS:
     crval2 = float(first_cell.get("CRVAL2", 0.0))
     crpix1 = float(first_cell.get("CRPIX1", 0.0))
     crpix2 = float(first_cell.get("CRPIX2", 0.0))
-    cd1_1 = float(first_cell.get("CD1_1", -1.0 / 3600))
-    cd1_2 = float(first_cell.get("CD1_2", 0.0))
-    cd2_1 = float(first_cell.get("CD2_1", 0.0))
-    cd2_2 = float(first_cell.get("CD2_2", 1.0 / 3600))
+    
+    cd = _get_cd_matrix(first_cell)
 
     # Create WCS object
     master_wcs = WCS(naxis=2)
     master_wcs.wcs.crval = [crval1, crval2]
     master_wcs.wcs.crpix = [crpix1 + PAD_SIZE, crpix2 + PAD_SIZE]  # Adjust for padding
-    master_wcs.wcs.cd = [[cd1_1, cd1_2], [cd2_1, cd2_2]]
+    master_wcs.wcs.cd = cd
     master_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     master_wcs.wcs.cunit = ["deg", "deg"]
 
@@ -307,13 +333,17 @@ def parse_row_padding_requirements(metadata: dict, csv_path: str, row_id: int, a
                 # e.g. don't apply "top" padding if we aren't at the top row
                 
                 valid = True
-                if "top" in location and row_position != "top": valid = False
-                if "bottom" in location and row_position != "bottom": valid = False
-                if "left" in location and cell_info_type != "first": valid = False
-                if "right" in location and cell_info_type != "last": valid = False
+                if "top" in location and row_position != "top":
+                    valid = False
+                if "bottom" in location and row_position != "bottom":
+                    valid = False
+                if "left" in location and cell_info_type != "first":
+                    valid = False
+                if "right" in location and cell_info_type != "last":
+                    valid = False
                 
                 if not valid:
-                    # logger.debug(f"Skipping {location} padding {p_cell} for {main_cell_name} (filtered)")
+                    logger.debug(f"Skipping {location} padding {p_cell} for {main_cell_name} (filtered)")
                     continue
                 
                 # Register
@@ -358,6 +388,114 @@ def analyze_padding_jobs(
     return list(jobs.values())
 
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+import time
+
+def _process_padding_job(job, state, config, metadata, master_wcs, master_wcs_next, zarr_path, current_df, current_reqs, next_reqs, write_lock):
+    """Helper to process a single padding job."""
+    try:
+        start_time = time.time()
+        # A. Load Source Data
+        parts = job.skycell_name.split(".")
+        if len(parts) != 3:
+            logger.warning(f"Invalid padding skycell name: {job.skycell_name}")
+            return False
+
+        source_skycell_id = parts[2]
+        source_proj = job.source_projection
+
+        # Load from Zarr
+        import zarr
+        try:
+            store = zarr.open(zarr_path, mode='r')
+            bands, masks, weights, headers, headers_weight = load_skycell_bands_masks_and_headers(store, source_proj, source_skycell_id)
+        except Exception as e:
+            logger.error(f"Failed to open/load from zarr store at {zarr_path}: {e}")
+            return False
+
+        if bands is None:
+            logger.warning(f"Failed to load padding data for {job.skycell_name}")
+            return False
+
+        # Process to Image
+        data, mask, _ = process_skycell_bands(bands, masks, weights, headers, headers_weight)
+
+        # Mask Edges
+        data = exclude_edge_pixels(data, EDGE_EXCLUSION)
+
+        # Create Source WCS
+        source_metadata = {"dataframe": current_df}
+        try:
+            source_wcs = create_cell_wcs(job.skycell_name, source_metadata)
+        except ValueError:
+            logger.warning(f"Could not create WCS for {job.skycell_name}")
+            return False
+
+        # B. Apply to Targets
+        for target_array, locations in job.targets:
+            # Re-find the requirement info
+            active_reqs = current_reqs if target_array is state.current_array else next_reqs
+            
+            # Select correct WCS
+            if target_array is state.current_array:
+                active_wcs = master_wcs
+            else:
+                active_wcs = master_wcs_next
+
+            if active_wcs is None:
+                logger.error(f"Active WCS is None for target! Job: {job.skycell_name}")
+                continue
+
+            if job.skycell_name not in active_reqs:
+                continue 
+
+            req_info = active_reqs[job.skycell_name]
+            cell_index = req_info.actual_index
+
+            for loc in locations:
+                # Create Localized Target WCS using ACTIVE WCS
+                target_wcs, target_shape, (y_center, x_center) = create_padding_wcs(
+                    active_wcs, config, loc, cell_index
+                )
+
+                # Reproject (Expensive, run concurrently)
+                reprojected, footprint = reproject_interp(
+                    (data, source_wcs),
+                    target_wcs,
+                    shape_out=target_shape,
+                    order="bilinear"
+                )
+
+                # Calculate placement coordinates
+                h, w = target_shape
+                y_start = int(y_center - h / 2)
+                y_end = int(y_start + h)
+                x_start = int(x_center - w / 2)
+                x_end = int(x_start + w)
+                
+                # Bounds check
+                if y_start < 0 or x_start < 0 or y_end > target_array.shape[0] or x_end > target_array.shape[1]:
+                    logger.warning(f"Padding out of bounds for {job.skycell_name} at {loc}")
+                    continue
+
+                # Stitch - thread safe write with lock
+                valid_mask = (~np.isnan(reprojected)) & (footprint > 0)
+
+                if np.any(valid_mask):
+                    with write_lock:
+                        target_slice = target_array[y_start:y_end, x_start:x_end]
+                        target_slice[valid_mask] = reprojected[valid_mask]
+
+        elapsed = time.time() - start_time
+        logger.info(f"Job {job.skycell_name} finished in {elapsed:.2f}s")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to process padding job {job.skycell_name}: {e}", exc_info=True)
+        return False
+
+
 def apply_cross_projection_padding(
     state, 
     config, 
@@ -369,9 +507,15 @@ def apply_cross_projection_padding(
 ):
     """
     Main entry point for applying cross-projection padding.
+    Parallelized version.
     """
     # 1. Gather Requirements
-    current_df = load_csv_data(csv_path)
+    try:
+        current_df = load_csv_data(csv_path)
+    except Exception as e:
+         logger.warning(f"Failed to load CSV {csv_path}: {e}")
+         return
+
     proj_df = current_df[current_df["projection"].astype(str) == str(metadata["projection"])]
     all_row_ids = sorted(proj_df["y"].unique())
     
@@ -387,123 +531,38 @@ def apply_cross_projection_padding(
     
     # 2. Create Jobs (Deduplicated)
     jobs = analyze_padding_jobs(current_reqs, next_reqs, state.current_array, state.next_array)
-    
+
+    if not jobs:
+        return
+
     # 3. Create Master WCS for Current Row (Used as reference base)
-    # We need a WCS that represents the 'master array' concept.
-    # Note: notebook used `create_master_array_wcs`. Here we create it once per row context.
     master_wcs = create_master_array_wcs(metadata, config, current_row_id) 
+    
+    master_wcs_next = None
+    if next_row_id is not None:
+         master_wcs_next = create_master_array_wcs(metadata, config, next_row_id) 
 
-    # 4. Execute Jobs
+    # 4. Execute Jobs in Parallel
+    write_lock = Lock()
+    num_workers = min(len(jobs), 8) # Limit parallelism sensibly
+    
+    logger.info(f"[CrossPadding] Starting {len(jobs)} jobs with {num_workers} threads.")
+    
     successful_jobs = 0
-    for job in jobs:
-        try:
-            # A. Load Source Data
-            # Note: We just need the skycell ID part "080" from "skycell.2556.080"
-            parts = job.skycell_name.split(".")
-            if len(parts) < 3:
-                logger.warning(f"Invalid padding skycell name: {job.skycell_name}")
-                continue
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for job in jobs:
+            future = executor.submit(
+                _process_padding_job,
+                job, state, config, metadata, master_wcs, master_wcs_next, zarr_path, current_df, current_reqs, next_reqs, write_lock
+            )
+            futures.append(future)
             
-            source_skycell_id = parts[2]
-            source_proj = job.source_projection
-            
-            # Load from Zarr
-            bands, masks, _, _, _ = load_skycell_bands_masks_and_headers(
-                None, source_proj, source_skycell_id, zarr_path=zarr_path
-            ) # Passing None as first arg because zarr_utils opens it internally if path provided? 
-              # Actually `load_skycell_bands..` takes (zarr_store, projection, skycell_id).
-              # We need to open the store or pass path. Let's open it to be safe.
-            
-            import zarr
-            store = zarr.open(zarr_path, mode='r')
-            bands, masks, _, _, _ = load_skycell_bands_masks_and_headers(store, source_proj, source_skycell_id)
-
-            if bands is None:
-                logger.warning(f"Failed to load padding data for {job.skycell_name}")
-                continue
-                
-            # Process to Image
-            data, mask, _ = process_skycell_bands(bands, masks)
-            
-            # Mask Edges
-            data = exclude_edge_pixels(data, EDGE_EXCLUSION)
-            
-            # Create Source WCS
-            # We need metadata for the source projection to create its WCS
-            # This is expensive if we reload CSV every time. 
-            # Ideally we cache `source_df`, but for now load it.
-            # Optimization: The CSV is likely the same one we already loaded? Yes usually.
-            source_metadata = {"dataframe": current_df} 
+        for future in futures:
             try:
-                source_wcs = create_cell_wcs(job.skycell_name, source_metadata)
-            except ValueError:
-                # Might be in a different CSV or missing from this one?
-                # Proceeding assuming it's in the same CSV
-                logger.warning(f"Could not create WCS for {job.skycell_name}")
-                continue
+                if future.result():
+                    successful_jobs += 1
+            except Exception as e:
+                logger.error(f"Job future failed: {e}")
 
-            # B. Apply to Targets
-            for target_array, locations in job.targets:
-                # Identify which main skycell in the TARGET ROW corresponds to this padding.
-                # This is tricky because `PaddingJob` decoupled the specific requirement info.
-                # However, the WCS creation depends on the index in the row.
-                # We need to know which cell index (0..N) in the target row this padding attaches to.
-                
-                # Re-find the requirement info to get correct cell index
-                # We check which request list this came from based on target array identity
-                active_reqs = current_reqs if target_array is state.current_array else next_reqs
-                active_row_id = current_row_id if target_array is state.current_array else next_row_id
-                
-                if job.skycell_name not in active_reqs:
-                    continue # Should not happen given job construction
-                
-                req_info = active_reqs[job.skycell_name]
-                cell_index_in_row = get_cell_index_in_row(active_row_id, req_info.skycell_name, metadata)
-                
-                # Wait, `get_cell_index_in_row` looks for the PADDING cell in the row? 
-                # NO. We need the index of the MAIN cell that is being padded.
-                # The `parse` function iterated over main cells. 
-                # We stored `actual_index` in `SkycellPaddingInfo`. That is exactly what we need.
-                cell_index = req_info.actual_index
-
-                for loc in locations:
-                    # Create Localized Target WCS
-                    target_wcs, target_shape, (y_center, x_center) = create_padding_wcs(
-                        master_wcs, config, loc, cell_index
-                    )
-                    
-                    # Reproject
-                    reprojected, footprint = reproject_interp(
-                        (data, source_wcs), 
-                        target_wcs, 
-                        shape_out=target_shape, 
-                        order="bilinear"
-                    )
-                    
-                    # Calculate placement coordinates
-                    h, w = target_shape
-                    y_start = int(y_center - h / 2)
-                    y_end = int(y_start + h)
-                    x_start = int(x_center - w / 2)
-                    x_end = int(x_start + w)
-
-                    # Bounds check
-                    if y_start < 0 or x_start < 0 or y_end > target_array.shape[0] or x_end > target_array.shape[1]:
-                         logger.warning(f"Padding out of bounds for {job.skycell_name} at {loc}")
-                         continue
-
-                    # Stitch (overwrite NaN/empty areas, or just overwrite period?)
-                    # Usually we just overwrite the padding region.
-                    # Use footprint/NaNs to mask
-                    valid_mask = (~np.isnan(reprojected)) & (footprint > 0)
-                    
-                    if np.any(valid_mask):
-                        target_slice = target_array[y_start:y_end, x_start:x_end]
-                        target_slice[valid_mask] = reprojected[valid_mask]
-
-            successful_jobs += 1
-
-        except Exception as e:
-            logger.error(f"Failed to process padding job {job.skycell_name}: {e}", exc_info=True)
-            
     logger.info(f"[CrossPadding] Applied {successful_jobs}/{len(jobs)} padding jobs.")
