@@ -238,13 +238,15 @@ def clear_sat_flags(mask_array: np.ndarray) -> None:
     mask_array &= ~np.uint32(sat_bit)
 
 
-def apply_saturation_to_row(state, cell_bundles, catalog_df):
+def apply_saturation_to_row(data_array, masks, cell_locations, cell_bundles, catalog_df):
     """
     Complete saturation correction for one row - simplified single function
 
     Args:
-        state: ProcessingState object with current_array and current_masks
-        cell_bundles: List of cell bundles for this row
+        data_array: The master data array (e.g. state.current_array)
+        masks: Dictionary of masks currently loaded (e.g. state.current_masks)
+        cell_locations: Dictionary of cell locations (e.g. state.cell_locations)
+        cell_bundles: List of cell bundles for this row (to access WCS)
         catalog_df: Pre-loaded catalog DataFrame
     """
     try:
@@ -259,7 +261,7 @@ def apply_saturation_to_row(state, cell_bundles, catalog_df):
             logger.warning("Failed to extract WCS from leftmost cell")
 
         # 2. Get data boundaries and extract region
-        positions = state.cell_locations
+        positions = cell_locations
         if not positions:
             return
         num_cells = len(positions)
@@ -270,13 +272,13 @@ def apply_saturation_to_row(state, cell_bundles, catalog_df):
         y_max = max(pos[3] for pos in positions.values())
 
         # Extract data region
-        data_region = state.current_array[y_min:y_max, x_min:x_max]
+        data_region = data_array[y_min:y_max, x_min:x_max]
 
         # Handle mask - create unified mask if needed
-        if hasattr(state, "current_masks") and state.current_masks:
+        if masks:
             # Create unified mask from cell masks
             mask_region = np.zeros((y_max - y_min, x_max - x_min), dtype=np.uint32)
-            for cell_name, cell_mask in state.current_masks.items():
+            for cell_name, cell_mask in masks.items():
                 if cell_name in positions and isinstance(cell_mask, np.ndarray):
                     # Map cell mask to unified mask position
                     cell_pos = positions[cell_name]
@@ -305,12 +307,12 @@ def apply_saturation_to_row(state, cell_bundles, catalog_df):
         replace_saturated_stars(data_array=data_region, mask_array=mask_region, num_chunks=num_cells, catalog=region_catalog, mask_bit_index=5)
 
         # 5. Put results back into main array
-        state.current_array[y_min:y_max, x_min:x_max] = data_region
+        data_array[y_min:y_max, x_min:x_max] = data_region
 
         # Update mask in state if it exists
-        if hasattr(state, "current_masks") and state.current_masks:
+        if masks:
             # Update the unified mask back to individual cell masks
-            for cell_name, cell_mask in state.current_masks.items():
+            for cell_name, cell_mask in masks.items():
                 if cell_name in positions and isinstance(cell_mask, np.ndarray):
                     cell_pos = positions[cell_name]
                     cell_x_start = cell_pos[0] - x_min

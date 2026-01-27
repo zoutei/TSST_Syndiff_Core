@@ -593,6 +593,10 @@ def process_row_step_from_queue(
         state.current_row_id = current_row_id
         logger.info(f"[SequentialProcessor] Built current row ID {current_row_id} with {len(positions)} cells.")
 
+        # Apply Saturation Correction
+        if enable_saturation_correction and catalog is not None:
+             apply_saturation_to_row(state.current_array, state.current_masks, state.cell_locations, current_row_bundles, catalog)
+
     # 2. Load the Next Row (Always)
     if next_row_id is not None:
         logger.info(f"[SequentialProcessor] Preparing next row ID {next_row_id}")
@@ -602,6 +606,11 @@ def process_row_step_from_queue(
         state.next_masks.update(masks)
         state.next_row_id = next_row_id
         logger.info(f"[SequentialProcessor] Prepared next row ID {next_row_id} with {len(state.next_cell_locations)} cells.")
+
+        # Apply Saturation Correction
+        if enable_saturation_correction and catalog is not None:
+             apply_saturation_to_row(state.next_array, state.next_masks, state.next_cell_locations, next_row_bundles, catalog)
+
     else:
         # Clear next state if there is no next row
         state.next_array.fill(np.nan)
@@ -610,21 +619,17 @@ def process_row_step_from_queue(
         state.next_row_id = None
         logger.info("[SequentialProcessor] No next row to prepare.")
 
-    # 3. Apply Saturation Correction
-    if enable_saturation_correction and catalog is not None:
-        apply_saturation_to_row(state, current_row_bundles, catalog)
- 
-    # 4. Apply Cross-Row Padding
+    # 3. Apply Cross-Row Padding
     apply_cross_row_padding(state, config)
 
-    # 5. Apply Cross-Projection Padding (if applicable)
+    np.savez(f"debug_cross_proj_row_{current_row_id}.npz", state=state, config=config, metadata=metadata, current_row_id=current_row_id, next_row_id=next_row_id, zarr_path=zarr_path, csv_path=csv_path)
+    raise RuntimeError("Debug stop")
+
+    # 4. Apply Cross-Projection Padding (if applicable)
     if csv_path:
         apply_cross_projection_padding(state, config, metadata, current_row_id, next_row_id, zarr_path, csv_path)
 
-    # np.savez(f"debug_row_{current_row_id}.npz", image=state, current_row_bundles=current_row_bundles)
-    # raise RuntimeError("Debug stop")
-
-    # 6. Perform Convolution
+    # 5. Perform Convolution
     nan_mask = np.isnan(state.current_array)
     state.current_array[nan_mask] = 0.0
     logger.info(f"[SequentialProcessor] Applying convolution for row ID {current_row_id}")
@@ -632,7 +637,7 @@ def process_row_step_from_queue(
     # Restore NaNs on the result, not the state array which will be replaced
     convolved_array[nan_mask] = np.nan
 
-    # 7. Extract and Return Results
+    # 6. Extract and Return Results
     results_data = extract_cell_results(convolved_array, state.cell_locations)
     results_masks = {name: mask for name, mask in state.current_masks.items() if name in state.cell_locations}
 
@@ -671,17 +676,23 @@ def sequential_processor(projections: list[str], df: pd.DataFrame, combined_cell
             # Determine Next Row
             next_row_id = row_ids[i + 1] if i + 1 < len(row_ids) else None
 
-            # Call the Helper Function to do the heavy lifting
-            results_data, results_masks = process_row_step_from_queue(state, config, metadata, current_row_id, next_row_id, combined_cell_queue, cell_buffer, psf_sigma, zarr_path, projection, catalog, enable_saturation_correction, csv_path)
+            try:
+                # Call the Helper Function to do the heavy lifting
+                results_data, results_masks = process_row_step_from_queue(state, config, metadata, current_row_id, next_row_id, combined_cell_queue, cell_buffer, psf_sigma, zarr_path, projection, catalog, enable_saturation_correction, csv_path)
 
-            # Queue the Results
-            processed_bundle = {"projection": projection, "row_id": current_row_id, "results_data": results_data, "results_masks": results_masks}
-            results_queue.put(processed_bundle)
-            logger.info(f"[SequentialProcessor] Finished processing and queued results for row {current_row_id}")
+                # Queue the Results
+                processed_bundle = {"projection": projection, "row_id": current_row_id, "results_data": results_data, "results_masks": results_masks}
+                results_queue.put(processed_bundle)
+                logger.info(f"[SequentialProcessor] Finished processing and queued results for row {current_row_id}")
 
-            # Advance the Window if not the last row
-            if next_row_id is not None:
-                advance_sliding_window(state)
+                # Advance the Window if not the last row
+                if next_row_id is not None:
+                    advance_sliding_window(state)
+            except Exception:
+                logger.exception(f"[SequentialProcessor] Critical failure processing row {current_row_id} for projection {projection}")
+                # If a row fails, the sliding window state for this projection is likely corrupted.
+                # Skip the rest of this projection.
+                break
 
         logger.info(f"[SequentialProcessor] --- Finished sequential processing for projection: {projection} ---")
 
@@ -770,7 +781,7 @@ def run_modern_sliding_window_pipeline(sector: int, camera: int, ccd: int, data_
             task_queue.put(None)
 
         # --- Run Sequential Processor (Stage 3) in Main Thread ---
-        sequential_processor(projections, df, combined_cell_queue, results_queue, psf_sigma, zarr_path, cell_buffer, catalog, enable_saturation_correction)
+        sequential_processor(projections, df, combined_cell_queue, results_queue, psf_sigma, zarr_path, cell_buffer, catalog, enable_saturation_correction, csv_path)
 
         # --- Final Shutdown Sequence ---
         logger.info("[Pipeline] Sequential processor finished. Shutting down upstream workers.")
