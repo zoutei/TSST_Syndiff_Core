@@ -332,7 +332,7 @@ def process_coordinator(raw_cell_queue: Queue, combined_cell_queue: Queue, cell_
                     total_pending = current_queue_size + current_buffer_size
                     logger.info(f"[ProcessCoordinator] Queue States - Raw: {raw_cell_queue.qsize()}, Combined: {current_queue_size}, Buffer: {current_buffer_size}, Active Tasks: {len(active_tasks)}, Total Pending: {total_pending}")
 
-                # ALWAYS check for completed tasks first on every iteration
+                # 1. ALWAYS check for completed tasks first
                 completed = set()
                 for future in list(active_tasks):
                     if future.done():
@@ -349,44 +349,32 @@ def process_coordinator(raw_cell_queue: Queue, combined_cell_queue: Queue, cell_
                         del futures[future]
                 active_tasks -= completed
 
-                # Get raw bundle from queue (non-blocking check)
+                # 2. Check Capacity (Look before you leap)
+                current_queue_size = combined_cell_queue.qsize()
+                current_buffer_size = calculate_total_buffer_size(cell_buffer)
+                total_pending = len(active_tasks) + current_queue_size + current_buffer_size
+
+                if total_pending >= MAX_TOTAL_PENDING_WORK:
+                    # System is overloaded. Do NOT fetch new work.
+                    # Just sleep briefly to avoid busy loop and continue to process completions.
+                    time.sleep(0.1)
+                    continue
+
+                # 3. Fetch New Work (Only if we have capacity)
                 try:
-                    raw_bundle = raw_cell_queue.get(timeout=1.0)
+                    # Non-blocking fetch
+                    raw_bundle = raw_cell_queue.get(timeout=0.1)
+                except Empty:
+                    # No new work, continue loop
+                    continue
                 except Exception:
-                    # Timeout or other queue error - continue the loop
                     continue
 
                 if raw_bundle is None:
                     logger.info("[ProcessCoordinator] Received shutdown signal")
                     break
 
-                # NEW: Check capacity before submitting (including buffer size)
-                current_queue_size = combined_cell_queue.qsize()
-                current_buffer_size = calculate_total_buffer_size(cell_buffer)
-                total_pending = len(active_tasks) + current_queue_size + current_buffer_size
-
-                if total_pending >= MAX_TOTAL_PENDING_WORK:
-                    # Don't submit, put raw_bundle back and process completions
-                    raw_cell_queue.put(raw_bundle)
-                    # Process completions and continue without submission
-                    completed = set()
-                    for future in list(active_tasks):
-                        if future.done():
-                            completed.add(future)
-                            try:
-                                result = future.result()
-                                if result is not None:
-                                    combined_cell_queue.put(result)
-                                else:
-                                    logger.warning(f"[ProcessCoordinator] Got None result for {futures[future]}")
-                            except Exception as e:
-                                logger.error(f"[ProcessCoordinator] Process failed for {futures[future]}: {e}")
-                            # Clean up
-                            del futures[future]
-                    active_tasks -= completed
-                    continue  # Skip submission this iteration
-
-                # Submit to process pool only if we have capacity
+                # 4. Submit Work
                 future = executor.submit(process_single_cell, raw_bundle)
                 futures[future] = raw_bundle["skycell_id"]
                 active_tasks.add(future)
@@ -566,6 +554,7 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
                     "x_coord": expected_cell_info[cell_name],
                     "combined_image": combined_image,
                     "combined_mask": combined_mask,
+                    "headers_data": headers_data,
                     # "combined_uncert": combined_uncert,
                 }
                 gathered_bundles.append(manual_bundle)
@@ -595,7 +584,10 @@ def process_row_step_from_queue(
 
         # Apply Saturation Correction
         if enable_saturation_correction and catalog is not None:
+             logger.info(f"[SequentialProcessor] Applying parallel saturation correction for current row {current_row_id}...")
+             start_sat = time.time()
              apply_saturation_to_row(state.current_array, state.current_masks, state.cell_locations, current_row_bundles, catalog)
+             logger.info(f"[SequentialProcessor] Saturation correction finished in {time.time() - start_sat:.2f}s")
 
     # 2. Load the Next Row (Always)
     if next_row_id is not None:
@@ -609,7 +601,10 @@ def process_row_step_from_queue(
 
         # Apply Saturation Correction
         if enable_saturation_correction and catalog is not None:
+             logger.info(f"[SequentialProcessor] Applying parallel saturation correction for next row {next_row_id}...")
+             start_sat = time.time()
              apply_saturation_to_row(state.next_array, state.next_masks, state.next_cell_locations, next_row_bundles, catalog)
+             logger.info(f"[SequentialProcessor] Saturation correction finished in {time.time() - start_sat:.2f}s")
 
     else:
         # Clear next state if there is no next row
@@ -622,12 +617,15 @@ def process_row_step_from_queue(
     # 3. Apply Cross-Row Padding
     apply_cross_row_padding(state, config)
 
-    np.savez(f"debug_cross_proj_row_{current_row_id}.npz", state=state, config=config, metadata=metadata, current_row_id=current_row_id, next_row_id=next_row_id, zarr_path=zarr_path, csv_path=csv_path)
-    raise RuntimeError("Debug stop")
+    # np.savez(f"debug_cross_proj_row_{current_row_id}.npz", state=state, config=config, metadata=metadata, current_row_id=current_row_id, next_row_id=next_row_id, zarr_path=zarr_path, csv_path=csv_path)
+    # raise RuntimeError("Debug stop")
 
     # 4. Apply Cross-Projection Padding (if applicable)
     if csv_path:
+        logger.info(f"[SequentialProcessor] Applying parallel cross-projection padding for row {current_row_id}...")
+        start_cp = time.time()
         apply_cross_projection_padding(state, config, metadata, current_row_id, next_row_id, zarr_path, csv_path)
+        logger.info(f"[SequentialProcessor] Cross-projection padding finished in {time.time() - start_cp:.2f}s")
 
     # 5. Perform Convolution
     nan_mask = np.isnan(state.current_array)
