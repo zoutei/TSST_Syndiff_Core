@@ -29,9 +29,9 @@ import convolution_utils
 import zarr_utils
 from band_utils import process_skycell_bands, remove_background
 from correct_saturation import apply_saturation_to_row
+from cross_projection_padding import apply_cross_projection_padding
 from csv_utils import find_csv_file, get_projections_from_csv, load_csv_data
 from zarr_utils import load_skycell_bands_masks_and_headers
-from cross_projection_padding import apply_cross_projection_padding
 
 logger = logging.getLogger(__name__)
 
@@ -566,7 +566,19 @@ def _gather_cells_for_row(projection: str, row_id: int, metadata: dict, combined
 
 
 def process_row_step_from_queue(
-    state: ProcessingState, config: MasterArrayConfig, metadata: dict, current_row_id: int, next_row_id: Optional[int], combined_cell_queue: Queue, cell_buffer: dict, psf_sigma: float, zarr_path: str, projection: str, catalog: Optional[pd.DataFrame] = None, enable_saturation_correction: bool = True, csv_path: Optional[str] = None
+    state: ProcessingState,
+    config: MasterArrayConfig,
+    metadata: dict,
+    current_row_id: int,
+    next_row_id: Optional[int],
+    combined_cell_queue: Queue,
+    cell_buffer: dict,
+    psf_sigma: float,
+    zarr_path: str,
+    projection: str,
+    catalog: Optional[pd.DataFrame] = None,
+    enable_saturation_correction: bool = True,
+    csv_path: Optional[str] = None,
 ) -> tuple[dict, dict]:
     """
     Encapsulates the logic for processing a single row step in the sliding window.
@@ -584,10 +596,10 @@ def process_row_step_from_queue(
 
         # Apply Saturation Correction
         if enable_saturation_correction and catalog is not None:
-             logger.info(f"[SequentialProcessor] Applying parallel saturation correction for current row {current_row_id}...")
-             start_sat = time.time()
-             apply_saturation_to_row(state.current_array, state.current_masks, state.cell_locations, current_row_bundles, catalog)
-             logger.info(f"[SequentialProcessor] Saturation correction finished in {time.time() - start_sat:.2f}s")
+            logger.info(f"[SequentialProcessor] Applying parallel saturation correction for current row {current_row_id}...")
+            start_sat = time.time()
+            apply_saturation_to_row(state.current_array, state.current_masks, state.cell_locations, current_row_bundles, catalog)
+            logger.info(f"[SequentialProcessor] Saturation correction finished in {time.time() - start_sat:.2f}s")
 
     # 2. Load the Next Row (Always)
     if next_row_id is not None:
@@ -601,10 +613,10 @@ def process_row_step_from_queue(
 
         # Apply Saturation Correction
         if enable_saturation_correction and catalog is not None:
-             logger.info(f"[SequentialProcessor] Applying parallel saturation correction for next row {next_row_id}...")
-             start_sat = time.time()
-             apply_saturation_to_row(state.next_array, state.next_masks, state.next_cell_locations, next_row_bundles, catalog)
-             logger.info(f"[SequentialProcessor] Saturation correction finished in {time.time() - start_sat:.2f}s")
+            logger.info(f"[SequentialProcessor] Applying parallel saturation correction for next row {next_row_id}...")
+            start_sat = time.time()
+            apply_saturation_to_row(state.next_array, state.next_masks, state.next_cell_locations, next_row_bundles, catalog)
+            logger.info(f"[SequentialProcessor] Saturation correction finished in {time.time() - start_sat:.2f}s")
 
     else:
         # Clear next state if there is no next row

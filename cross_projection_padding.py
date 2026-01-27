@@ -13,16 +13,16 @@ Key features:
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from astropy.wcs import WCS
 from reproject import reproject_interp
 
+from band_utils import process_skycell_bands
 from csv_utils import load_csv_data
 from zarr_utils import load_skycell_bands_masks_and_headers
-from band_utils import process_skycell_bands
 
 logger = logging.getLogger(__name__)
 
@@ -35,32 +35,35 @@ EDGE_EXCLUSION = 10
 @dataclass
 class SkycellPaddingInfo:
     """Information about a single padding requirement for a specific skycell."""
+
     skycell_name: str
     projection: str
     locations: List[str]  # e.g., ["top", "top_left"]
-    cell_position: str    # "first", "last", "interior"
-    row_position: str     # "top", "bottom", "middle"
-    actual_index: int     # Index in the row
+    cell_position: str  # "first", "last", "interior"
+    row_position: str  # "top", "bottom", "middle"
+    actual_index: int  # Index in the row
 
 
 @dataclass
 class PaddingJob:
     """
     A unit of work: one skycell to be loaded and applied to one or more targets.
-    
+
     Attributes:
         skycell_name: Name of the skycell to load (e.g., "skycell.2556.080")
         source_projection: Projection ID of the source skycell
-        targets: List of (target_array, locations) tuples. 
+        targets: List of (target_array, locations) tuples.
                  target_array is the destination (current or next array).
                  locations is a list of strings (e.g., ["bottom"]) for that target.
     """
+
     skycell_name: str
     source_projection: str
     targets: List[Tuple[np.ndarray, List[str]]] = field(default_factory=list)
 
 
 # --- Helper Functions (Ported from Notebook & modern_padding) ---
+
 
 def determine_row_position(row_id: int, all_row_ids: List[int]) -> str:
     """Determine if row is top, bottom, or middle row in projection."""
@@ -88,33 +91,23 @@ def analyze_cell_positions(row_cells: List[str]) -> Dict[str, str]:
     return positions
 
 
-
 def _get_cd_matrix(row: pd.Series) -> List[List[float]]:
     """Helper to extract CD matrix from row, handling CD vs CDELT/PC."""
     # Try explicit CD matrix first
     if "CD1_1" in row:
-        return [
-            [float(row.get(f"CD{i}_{j}", 0.0)) for j in [1, 2]] 
-            for i in [1, 2]
-        ]
-    
+        return [[float(row.get(f"CD{i}_{j}", 0.0)) for j in [1, 2]] for i in [1, 2]]
+
     # Try CDELT + PC
     # Default PC is identity if missing, but usually present if CDELT is present
     if "CDELT1" in row:
         cdelt = [float(row.get(f"CDELT{i}", 1.0)) for i in [1, 2]]
-        pc = [
-            [float(row.get(f"PC{i}_{j}", 0.0 if i != j else 1.0)) for j in [1, 2]]
-            for i in [1, 2]
-        ]
+        pc = [[float(row.get(f"PC{i}_{j}", 0.0 if i != j else 1.0)) for j in [1, 2]] for i in [1, 2]]
         # CD_ij = CDELT_i * PC_ij
-        cd = [
-            [cdelt[i-1] * pc[i-1][j-1] for j in [1, 2]]
-            for i in [1, 2]
-        ]
+        cd = [[cdelt[i - 1] * pc[i - 1][j - 1] for j in [1, 2]] for i in [1, 2]]
         return cd
 
     # Fallback to default (approx 1 arcsec/pixel, flipped RA)
-    return [[-1.0/3600, 0.0], [0.0, 1.0/3600]]
+    return [[-1.0 / 3600, 0.0], [0.0, 1.0 / 3600]]
 
 
 def create_cell_wcs(cell_name: str, metadata: dict) -> WCS:
@@ -130,7 +123,7 @@ def create_cell_wcs(cell_name: str, metadata: dict) -> WCS:
     # Extract WCS parameters
     crval = [float(cell_data.get(f"CRVAL{i}", 0.0)) for i in [1, 2]]
     crpix = [float(cell_data.get(f"CRPIX{i}", 0.0)) for i in [1, 2]]
-    
+
     cd = _get_cd_matrix(cell_data)
 
     wcs = WCS(naxis=2)
@@ -153,12 +146,12 @@ def create_padding_wcs(master_wcs: WCS, config, location: str, cell_index: int) 
     # Cell boundaries in master array (for top/bottom padding)
     cell_x_start = PAD_SIZE + cell_index * (config.cell_width - CELL_OVERLAP)
     cell_x_center = cell_x_start + cell_width / 2
-    
+
     # Calculate key Y coordinates
     cell_y_top = PAD_SIZE + cell_height + (PAD_SIZE - EDGE_EXCLUSION) / 2
     cell_y_bottom = (PAD_SIZE + EDGE_EXCLUSION) / 2
     cell_y_center = PAD_SIZE + cell_height / 2
-    
+
     # Calculate key X coordinates
     cell_x_left = cell_x_start - (PAD_SIZE - EDGE_EXCLUSION) / 2
     cell_x_right = cell_x_start + cell_width + (PAD_SIZE - EDGE_EXCLUSION) / 2
@@ -198,7 +191,7 @@ def create_padding_wcs(master_wcs: WCS, config, location: str, cell_index: int) 
     else:
         padding_wcs.wcs.pc = master_wcs.wcs.pc.copy()
         padding_wcs.wcs.cdelt = master_wcs.wcs.cdelt.copy()
-    
+
     return padding_wcs, (int(padding_height), int(padding_width)), (padding_y_center, padding_x_center)
 
 
@@ -216,7 +209,7 @@ def determine_cell_position_from_skycell(main_skycell: str, metadata: dict) -> T
     """Find the (row_index, cell_index) for a given skycell name in the metadata."""
     # Note: row_index here is just the index in the sorted list of rows, not the row_id
     sorted_row_ids = sorted(metadata["rows"].keys())
-    
+
     for r_idx, row_id in enumerate(sorted_row_ids):
         cells = metadata["rows"][row_id]
         for c_idx, (cell_name, _) in enumerate(cells):
@@ -254,7 +247,7 @@ def create_master_array_wcs(metadata: dict, config, current_row_id: int) -> WCS:
     crval2 = float(first_cell.get("CRVAL2", 0.0))
     crpix1 = float(first_cell.get("CRPIX1", 0.0))
     crpix2 = float(first_cell.get("CRPIX2", 0.0))
-    
+
     cd = _get_cd_matrix(first_cell)
 
     # Create WCS object
@@ -270,6 +263,7 @@ def create_master_array_wcs(metadata: dict, config, current_row_id: int) -> WCS:
 
 # --- Core Logic ---
 
+
 def parse_row_padding_requirements(metadata: dict, csv_path: str, row_id: int, all_row_ids: List[int]) -> Dict[str, SkycellPaddingInfo]:
     """
     Parse the CSV to find all cross-projection padding requirements for a specific row.
@@ -277,61 +271,56 @@ def parse_row_padding_requirements(metadata: dict, csv_path: str, row_id: int, a
     """
     df = load_csv_data(csv_path)
     current_projection = metadata["projection"]
-    
+
     # Get cells for this row
     if row_id not in metadata["rows"]:
         return {}
-    
+
     # metadata["rows"][row_id] is a list of (cell_name, x_coord) tuples
     row_cells = [c[0] for c in metadata["rows"][row_id]]
-    
+
     # Determine context
     row_position = determine_row_position(row_id, all_row_ids)
     cell_positions = analyze_cell_positions(row_cells)
-    
+
     # Filter CSV for this row
     proj_df = df[df["projection"].astype(str) == str(current_projection)]
     row_df = proj_df[proj_df["y"] == row_id]
-    
+
     requirements = {}
-    
-    padding_cols = [
-        "pad_skycell_top", "pad_skycell_bottom", 
-        "pad_skycell_left", "pad_skycell_right", 
-        "pad_skycell_top_left", "pad_skycell_top_right", 
-        "pad_skycell_bottom_left", "pad_skycell_bottom_right"
-    ]
-    
+
+    padding_cols = ["pad_skycell_top", "pad_skycell_bottom", "pad_skycell_left", "pad_skycell_right", "pad_skycell_top_left", "pad_skycell_top_right", "pad_skycell_bottom_left", "pad_skycell_bottom_right"]
+
     for _, row_data in row_df.iterrows():
         main_cell_name = row_data["NAME"]
         if main_cell_name not in row_cells:
             continue
-            
+
         cell_info_type = cell_positions.get(main_cell_name, "interior")
-        
+
         for col in padding_cols:
             val = row_data.get(col)
             if pd.isna(val) or not str(val).strip():
                 continue
-                
+
             # Handle possible multiple cells (slash separated - rare but possible)
             padding_cells = [c.strip() for c in str(val).split("/") if c.strip()]
             location = col.replace("pad_skycell_", "")
-            
+
             for p_cell in padding_cells:
                 # Check if cross-projection
                 try:
                     p_proj = p_cell.split(".")[1]
                 except IndexError:
                     continue
-                    
+
                 if p_proj == str(current_projection):
-                    continue # Skip intra-projection padding
-                
+                    continue  # Skip intra-projection padding
+
                 # Apply Filtering Logic (defensive check)
                 # Only trust the CSV if it makes geometric sense
                 # e.g. don't apply "top" padding if we aren't at the top row
-                
+
                 valid = True
                 if "top" in location and row_position != "top":
                     valid = False
@@ -341,56 +330,45 @@ def parse_row_padding_requirements(metadata: dict, csv_path: str, row_id: int, a
                     valid = False
                 if "right" in location and cell_info_type != "last":
                     valid = False
-                
+
                 if not valid:
                     logger.debug(f"Skipping {location} padding {p_cell} for {main_cell_name} (filtered)")
                     continue
-                
+
                 # Register
                 if p_cell not in requirements:
-                    requirements[p_cell] = SkycellPaddingInfo(
-                        skycell_name=p_cell,
-                        projection=p_proj,
-                        locations=[],
-                        cell_position=cell_info_type,
-                        row_position=row_position,
-                        actual_index=row_cells.index(main_cell_name)
-                    )
+                    requirements[p_cell] = SkycellPaddingInfo(skycell_name=p_cell, projection=p_proj, locations=[], cell_position=cell_info_type, row_position=row_position, actual_index=row_cells.index(main_cell_name))
                 requirements[p_cell].locations.append(location)
 
     return requirements
 
 
-def analyze_padding_jobs(
-    current_reqs: Dict[str, SkycellPaddingInfo], 
-    next_reqs: Dict[str, SkycellPaddingInfo],
-    current_array: np.ndarray,
-    next_array: np.ndarray
-) -> List[PaddingJob]:
+def analyze_padding_jobs(current_reqs: Dict[str, SkycellPaddingInfo], next_reqs: Dict[str, SkycellPaddingInfo], current_array: np.ndarray, next_array: np.ndarray) -> List[PaddingJob]:
     """
     Consolidate requirements from current and next rows into a unique list of jobs.
     If a skycell is needed by both, one job handles both targets to avoid double loading.
     """
     jobs = {}
-    
+
     # Process Current Row Requirements
     for name, info in current_reqs.items():
         if name not in jobs:
             jobs[name] = PaddingJob(name, info.projection)
         jobs[name].targets.append((current_array, info.locations))
-        
+
     # Process Next Row Requirements
     for name, info in next_reqs.items():
         if name not in jobs:
             jobs[name] = PaddingJob(name, info.projection)
         jobs[name].targets.append((next_array, info.locations))
-        
+
     return list(jobs.values())
 
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
-import time
+
 
 def _process_padding_job(job, state, config, metadata, master_wcs, master_wcs_next, zarr_path, current_df, current_reqs, next_reqs, write_lock):
     """Helper to process a single padding job."""
@@ -407,8 +385,9 @@ def _process_padding_job(job, state, config, metadata, master_wcs, master_wcs_ne
 
         # Load from Zarr
         import zarr
+
         try:
-            store = zarr.open(zarr_path, mode='r')
+            store = zarr.open(zarr_path, mode="r")
             bands, masks, weights, headers, headers_weight = load_skycell_bands_masks_and_headers(store, source_proj, source_skycell_id)
         except Exception as e:
             logger.error(f"Failed to open/load from zarr store at {zarr_path}: {e}")
@@ -436,7 +415,7 @@ def _process_padding_job(job, state, config, metadata, master_wcs, master_wcs_ne
         for target_array, locations in job.targets:
             # Re-find the requirement info
             active_reqs = current_reqs if target_array is state.current_array else next_reqs
-            
+
             # Select correct WCS
             if target_array is state.current_array:
                 active_wcs = master_wcs
@@ -448,24 +427,17 @@ def _process_padding_job(job, state, config, metadata, master_wcs, master_wcs_ne
                 continue
 
             if job.skycell_name not in active_reqs:
-                continue 
+                continue
 
             req_info = active_reqs[job.skycell_name]
             cell_index = req_info.actual_index
 
             for loc in locations:
                 # Create Localized Target WCS using ACTIVE WCS
-                target_wcs, target_shape, (y_center, x_center) = create_padding_wcs(
-                    active_wcs, config, loc, cell_index
-                )
+                target_wcs, target_shape, (y_center, x_center) = create_padding_wcs(active_wcs, config, loc, cell_index)
 
                 # Reproject (Expensive, run concurrently)
-                reprojected, footprint = reproject_interp(
-                    (data, source_wcs),
-                    target_wcs,
-                    shape_out=target_shape,
-                    order="bilinear"
-                )
+                reprojected, footprint = reproject_interp((data, source_wcs), target_wcs, shape_out=target_shape, order="bilinear")
 
                 # Calculate placement coordinates
                 h, w = target_shape
@@ -473,7 +445,7 @@ def _process_padding_job(job, state, config, metadata, master_wcs, master_wcs_ne
                 y_end = int(y_start + h)
                 x_start = int(x_center - w / 2)
                 x_end = int(x_start + w)
-                
+
                 # Bounds check
                 if y_start < 0 or x_start < 0 or y_end > target_array.shape[0] or x_end > target_array.shape[1]:
                     logger.warning(f"Padding out of bounds for {job.skycell_name} at {loc}")
@@ -496,15 +468,7 @@ def _process_padding_job(job, state, config, metadata, master_wcs, master_wcs_ne
         return False
 
 
-def apply_cross_projection_padding(
-    state, 
-    config, 
-    metadata: dict, 
-    current_row_id: int, 
-    next_row_id: Optional[int], 
-    zarr_path: str, 
-    csv_path: str
-):
+def apply_cross_projection_padding(state, config, metadata: dict, current_row_id: int, next_row_id: Optional[int], zarr_path: str, csv_path: str):
     """
     Main entry point for applying cross-projection padding.
     Parallelized version.
@@ -513,22 +477,22 @@ def apply_cross_projection_padding(
     try:
         current_df = load_csv_data(csv_path)
     except Exception as e:
-         logger.warning(f"Failed to load CSV {csv_path}: {e}")
-         return
+        logger.warning(f"Failed to load CSV {csv_path}: {e}")
+        return
 
     proj_df = current_df[current_df["projection"].astype(str) == str(metadata["projection"])]
     all_row_ids = sorted(proj_df["y"].unique())
-    
+
     current_reqs = parse_row_padding_requirements(metadata, csv_path, current_row_id, all_row_ids)
     next_reqs = {}
     if next_row_id is not None:
         next_reqs = parse_row_padding_requirements(metadata, csv_path, next_row_id, all_row_ids)
-        
+
     if not current_reqs and not next_reqs:
         return
 
     logger.info(f"[CrossPadding] Found {len(current_reqs)} reqs for current, {len(next_reqs)} for next.")
-    
+
     # 2. Create Jobs (Deduplicated)
     jobs = analyze_padding_jobs(current_reqs, next_reqs, state.current_array, state.next_array)
 
@@ -536,28 +500,25 @@ def apply_cross_projection_padding(
         return
 
     # 3. Create Master WCS for Current Row (Used as reference base)
-    master_wcs = create_master_array_wcs(metadata, config, current_row_id) 
-    
+    master_wcs = create_master_array_wcs(metadata, config, current_row_id)
+
     master_wcs_next = None
     if next_row_id is not None:
-         master_wcs_next = create_master_array_wcs(metadata, config, next_row_id) 
+        master_wcs_next = create_master_array_wcs(metadata, config, next_row_id)
 
     # 4. Execute Jobs in Parallel
     write_lock = Lock()
-    num_workers = min(len(jobs), 8) # Limit parallelism sensibly
-    
+    num_workers = min(len(jobs), 8)  # Limit parallelism sensibly
+
     logger.info(f"[CrossPadding] Starting {len(jobs)} jobs with {num_workers} threads.")
-    
+
     successful_jobs = 0
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
         for job in jobs:
-            future = executor.submit(
-                _process_padding_job,
-                job, state, config, metadata, master_wcs, master_wcs_next, zarr_path, current_df, current_reqs, next_reqs, write_lock
-            )
+            future = executor.submit(_process_padding_job, job, state, config, metadata, master_wcs, master_wcs_next, zarr_path, current_df, current_reqs, next_reqs, write_lock)
             futures.append(future)
-            
+
         for future in futures:
             try:
                 if future.result():

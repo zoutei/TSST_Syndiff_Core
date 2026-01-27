@@ -1,15 +1,13 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-
-from astropy.wcs import WCS
 from astropy.modeling import fitting, models
 from astropy.nddata import NDData
 from astropy.table import Table
+from astropy.wcs import WCS
 from photutils.psf import EPSFBuilder, extract_stars
-
-from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +30,7 @@ def filter_catalog_for_region(catalog_df, wcs, x_min, x_max, y_min, y_max):
         # Use separate x, y arrays instead of coordinate pairs to avoid confusion
         corners_x = np.array([x_min, x_max, x_min, x_max])
         corners_y = np.array([y_min, y_min, y_max, y_max])
-        
+
         # Validate WCS is celestial
         if not wcs.is_celestial:
             logger.warning("WCS is not celestial, skipping catalog filtering")
@@ -40,7 +38,7 @@ def filter_catalog_for_region(catalog_df, wcs, x_min, x_max, y_min, y_max):
 
         # Use low-level API to avoid SkyCoord dimension issues
         ra_bounds, dec_bounds = wcs.all_pix2world(corners_x, corners_y, 0)
-        
+
         # Check if coordinates are valid
         if not np.all(np.isfinite(ra_bounds)) or not np.all(np.isfinite(dec_bounds)):
             logger.warning("Invalid pixel coordinates for WCS transformation")
@@ -92,7 +90,7 @@ def _process_saturation_chunk(i, chunk_width, width, height, data_array, mask_ar
         sat_stars = stars_in_chunk[stars_in_chunk["phot_rp_mean_mag"] <= max_mag_replace]
 
         if len(good_stars) == 0:
-            logger.warning(f"No good stars in chunk {i}, skipping.")
+            logger.error(f"No good stars in chunk {i}, skipping.")
             return
 
         logger.info(f"Chunk {i}: Start processing. {len(good_stars['x'])} good stars. {len(sat_stars)} saturated stars")
@@ -100,14 +98,14 @@ def _process_saturation_chunk(i, chunk_width, width, height, data_array, mask_ar
         # Prepare data for ePSF extraction
         # Note: We are reading from shared data_array/mask_array. This is thread-safe for reads.
         # Writes happen later and are spatially distinct (mostly).
-        
+
         # Optimization: We define the mask locally for EPSF extraction
         # We don't need the global mask_for_epsf unless we want to execute strict exclusion
         # but NDData expects a mask of the same size as data.
         # Passing full array is fine.
-        
-        # mask_for_epsf = ~np.isfinite(data_array) 
-        # Making a full copy of mask for every thread is expensive. 
+
+        # mask_for_epsf = ~np.isfinite(data_array)
+        # Making a full copy of mask for every thread is expensive.
         # NDData doesn't copy data/mask by default, but extract_stars will access it.
         # For thread safety with minimal overhead, we just use the shared arrays.
         # A read-only view would be ideal but numpy slicing is fine.
@@ -122,10 +120,10 @@ def _process_saturation_chunk(i, chunk_width, width, height, data_array, mask_ar
         try:
             stars_tbl = extract_stars(data_nd, positions, size=star_half_size * 2 + 1)
             if len(stars_tbl) == 0:
-                logger.warning(f"Chunk {i}: No stars extracted in chunk {i}, skipping.")
+                logger.error(f"Chunk {i}: No stars extracted in chunk {i}, skipping.")
                 return
         except Exception as e:
-            logger.warning(f"Chunk {i}: Error extracting stars in chunk {i}: {e}")
+            logger.error(f"Chunk {i}: Error extracting stars in chunk {i}: {e}")
             return
 
         # Build ePSF
@@ -134,7 +132,7 @@ def _process_saturation_chunk(i, chunk_width, width, height, data_array, mask_ar
         try:
             epsf, _ = epsf_builder(stars_tbl)
         except Exception as e:
-            logger.warning(f"Chunk {i}: Error building ePSF in chunk {i}: {e}")
+            logger.error(f"Chunk {i}: Error building ePSF in chunk {i}: {e}")
             return
         logger.info(f"Chunk {i}: epsf built")
 
@@ -147,7 +145,7 @@ def _process_saturation_chunk(i, chunk_width, width, height, data_array, mask_ar
         # Since we just overwrite pixels, worst case is a race condition on the boundary pixels.
         # Given the rarity and the nature of "blending", strict locking might be overkill vs performance.
         # We accept this minor risk for speed.
-        
+
         replaced_count = 0
         for idx, star in sat_stars.iterrows():
             global_x = star["x"]
@@ -220,22 +218,16 @@ def replace_saturated_stars(data_array, mask_array, num_chunks, catalog, max_mag
     """
     height, width = data_array.shape
     chunk_width = width // num_chunks
-    
+
     logger.info(f"[Saturation] Starting parallel saturation correction with {num_chunks} chunks/threads.")
 
     with ThreadPoolExecutor(max_workers=num_chunks) as executor:
         futures = []
         for i in range(num_chunks):
             # Submit task
-            future = executor.submit(
-                _process_saturation_chunk, 
-                i, chunk_width, width, height, 
-                data_array, mask_array, catalog, 
-                min_mag_epsf, max_mag_epsf, max_mag_replace, mag_threshold_epsf, 
-                star_half_size, mask_bit_index
-            )
+            future = executor.submit(_process_saturation_chunk, i, chunk_width, width, height, data_array, mask_array, catalog, min_mag_epsf, max_mag_epsf, max_mag_replace, mag_threshold_epsf, star_half_size, mask_bit_index)
             futures.append(future)
-        
+
         # Wait for all
         total_replaced = 0
         for future in futures:
@@ -278,7 +270,7 @@ def filter_catalog_for_row(catalog_df: pd.DataFrame, cell_positions: dict, wcs) 
 def clear_sat_flags(mask_array: np.ndarray) -> None:
     """Clear bit 5 (SAT flag) from all pixels in the mask array."""
     sat_bit = 1 << 5  # Bit 5 = 32
-    # Use numpy bitwise_not to ensure we stay in uint32 domain if passed array is uint32, 
+    # Use numpy bitwise_not to ensure we stay in uint32 domain if passed array is uint32,
     # but here we operate with a scalar. ~np.uint32(sat_bit) gives a large positive integer.
     mask_array &= ~np.uint32(sat_bit)
 
@@ -299,7 +291,7 @@ def apply_saturation_to_row(data_array, masks, cell_locations, cell_bundles, cat
         leftmost = min(cell_bundles, key=lambda b: b["x_coord"])
         wcs = None
         try:
-            wcs = WCS(leftmost["headers_data"]['i'])
+            wcs = WCS(leftmost["headers_data"]["i"])
             if wcs.naxis > 2:
                 wcs = wcs.celestial
         except Exception:
