@@ -76,6 +76,8 @@ from astropy.io import fits
 from dask.diagnostics import ProgressBar
 from filelock import FileLock
 
+import csv_utils
+
 # --- Configuration ---
 # Default logging level is set in main() based on command line arguments
 # Global variables for signal handling
@@ -83,6 +85,7 @@ shutdown_requested = False
 active_executors = []
 active_dask_computations = []
 
+logger = logging.getLogger(__name__)
 
 def signal_handler(signum, frame):
     """
@@ -537,7 +540,32 @@ def download_and_store_ps1_data(sector=20, camera=3, ccd=3, num_workers=8, zarr_
     skycells_df = pd.read_csv(skycell_list_csv)
 
     # Get unique PS1 images
-    unique_ps1_images = skycells_df["NAME"].unique()
+    unique_ps1_images = set(skycells_df["NAME"].unique())
+    logger.info(f"Found {len(unique_ps1_images)} main skycells")
+
+    # Get padding cells
+    try:
+        padding_map = csv_utils.get_all_padding_cells(str(skycell_list_csv), list(unique_ps1_images))
+        padding_cells = set()
+        for cells in padding_map.values():
+            padding_cells.update(cells)
+        
+        num_padding = len(padding_cells)
+        logger.info(f"Found {num_padding} additional padding skycells")
+        
+        # Merge padding cells
+        unique_ps1_images.update(padding_cells)
+        
+    except Exception as e:
+        logger.error(f"Failed to get padding cells: {e}")
+        # Continue with just main cells if padding fails? 
+        # Better to warn but continue, or fail? The user wants padding, so this is important.
+        # But if the CSV doesn't support it or something, maybe we shouldn't crash the whole download.
+        logger.warning("Continuing with main skycells only.")
+
+    # Convert back to list for processing
+    unique_ps1_images = sorted(list(unique_ps1_images))
+    logger.info(f"Found {len(unique_ps1_images)} total skycells to process")
 
     # Create output directory
     zarr_output_dir.mkdir(parents=True, exist_ok=True)

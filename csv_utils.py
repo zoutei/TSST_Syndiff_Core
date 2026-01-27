@@ -87,7 +87,7 @@ def get_padding_info(csv_path: str, skycell: str) -> dict[str, list[str]]:
         Dictionary mapping direction to list of padding skycells
     """
     df = load_csv_data(csv_path)
-    cell_row = df[df["skycell"] == skycell]
+    cell_row = df[df["NAME"] == skycell]
 
     if len(cell_row) == 0:
         logger.warning(f"[CSV] Skycell {skycell} not found in CSV")
@@ -103,8 +103,9 @@ def get_padding_info(csv_path: str, skycell: str) -> dict[str, list[str]]:
         if col in row and pd.notna(row[col]) and row[col] != "":
             direction = col.replace("pad_skycell_", "")
 
-            # Handle multiple skycells (could be comma-separated)
-            padding_cells = str(row[col]).split(",")
+            # Handle multiple skycells (could be comma-separated or slash-separated)
+            cell_str = str(row[col]).replace("/", ",")
+            padding_cells = cell_str.split(",")
             padding_cells = [cell.strip() for cell in padding_cells if cell.strip()]
 
             if padding_cells:
