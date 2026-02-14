@@ -16,6 +16,7 @@ FITS files, providing better performance and organization.
 import time
 from glob import glob
 from pathlib import Path
+import re
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,15 @@ from tqdm import tqdm
 
 # Import from existing script
 from compute_ps1_skycell_shifts import RELEVANT_WCS_KEYS, build_ps1_wcs, compute_ps1_shift_for_skycell, load_tess_wcs
+
+
+def extract_skycell_name_from_reg_file(reg_file: str) -> str | None:
+    """Extract skycell.<proj>.<cell> from a registration filename."""
+    fname = Path(reg_file).name
+    match = re.search(r"(skycell\.\d+\.\d+)", fname)
+    if match:
+        return match.group(1)
+    return None
 
 
 def load_zarr_metadata(sector: int, camera: int, ccd: int, convolved_data_path: Path) -> tuple[dict, Path]:
@@ -121,7 +131,7 @@ def precompute_shifts_for_offsets(tess_wcs: WCS, skycell_df: pd.DataFrame, offse
     return shift_results
 
 
-def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: list[str], offsets: np.ndarray, shifts_dict: dict[tuple[float, float], pd.DataFrame], tess_shape: tuple[int, int], zarr_path: Path, ignore_mask_bits: list[int] = []) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: list[str], offsets: np.ndarray, shifts_dict: dict[tuple[float, float], pd.DataFrame], base_tess_shape: tuple[int, int], zarr_path: Path, roi_bounds: tuple[int, int, int, int], oversampling_factor: int = 1, ignore_mask_bits: list[int] = []) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Process a batch of skycells using sparse arrays for memory efficiency
 
@@ -132,8 +142,9 @@ def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: l
         - counts: Array of shape (len(indices), num_offsets) with count values
         - mask_counts: Array of shape (len(indices), num_offsets) with mask count values
     """
-    t_y, t_x = tess_shape
+    t_y, t_x = base_tess_shape
     num_offsets = len(offsets)
+    x_min, y_min, x_max, y_max = roi_bounds
 
     # Lists to collect values (will convert to arrays later)
     all_indices = []
@@ -228,8 +239,18 @@ def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: l
                     pixel_mask_counts[:, offset_idx] = mask_counts
 
                 # Add all valid pixels from this skycell to our results
-                # Filter out pixels outside the image bounds
-                valid_mask = (tess_pixels // t_x < t_y) & (tess_pixels % t_x < t_x)
+                # Filter by valid base-scale TESS bounds + ROI bounds.
+                if oversampling_factor > 1:
+                    os_width = t_x * oversampling_factor
+                    y_os = tess_pixels // os_width
+                    x_os = tess_pixels % os_width
+                    y_base = y_os // oversampling_factor
+                    x_base = x_os // oversampling_factor
+                else:
+                    y_base = tess_pixels // t_x
+                    x_base = tess_pixels % t_x
+
+                valid_mask = (0 <= y_base) & (y_base < t_y) & (0 <= x_base) & (x_base < t_x) & (x_base >= x_min) & (x_base < x_max) & (y_base >= y_min) & (y_base < y_max)
 
                 if np.any(valid_mask):
                     all_indices.append(tess_pixels[valid_mask])
@@ -262,7 +283,7 @@ def process_skycell_batch(batch_idx: int, reg_files: list[str], skycell_names: l
     return indices, sums, counts, mask_counts
 
 
-def create_syndiff_header(tess_header):
+def create_syndiff_header(tess_header, roi_bounds: tuple[int, int, int, int] | None = None, oversampling_factor: int = 1):
     """
     Create a header for the syndiff output based on the TESS header.
     """
@@ -289,10 +310,45 @@ def create_syndiff_header(tess_header):
     # Add syndiff tag
     syndiff_header.set("SYNDIFF", True, "Syndiff template")
 
+    # Apply oversampling WCS scaling if needed (smaller pixel scale).
+    if oversampling_factor > 1:
+        for key in ["CD1_1", "CD1_2", "CD2_1", "CD2_2", "CDELT1", "CDELT2"]:
+            if key in syndiff_header:
+                syndiff_header[key] = syndiff_header[key] / oversampling_factor
+        syndiff_header.set("OVERSAMP", oversampling_factor, "Oversampling factor")
+
+    # Apply ROI crop metadata and CRPIX shift.
+    if roi_bounds is not None:
+        x_min, y_min, x_max, y_max = roi_bounds
+        shift_x = x_min * oversampling_factor
+        shift_y = y_min * oversampling_factor
+
+        if "CRPIX1" in syndiff_header:
+            syndiff_header["CRPIX1"] = syndiff_header["CRPIX1"] - shift_x
+        if "CRPIX2" in syndiff_header:
+            syndiff_header["CRPIX2"] = syndiff_header["CRPIX2"] - shift_y
+
+        syndiff_header.set("XMIN", x_min, "ROI xmin in base TESS pixels")
+        syndiff_header.set("XMAX", x_max, "ROI xmax (exclusive) in base TESS pixels")
+        syndiff_header.set("YMIN", y_min, "ROI ymin in base TESS pixels")
+        syndiff_header.set("YMAX", y_max, "ROI ymax (exclusive) in base TESS pixels")
+        syndiff_header.set("ROIW", x_max - x_min, "ROI width in base TESS pixels")
+        syndiff_header.set("ROIH", y_max - y_min, "ROI height in base TESS pixels")
+
     return syndiff_header
 
 
-def save_fits_outputs(output_dir: Path, sector: int, camera: int, ccd: int, results: np.ndarray, offsets: np.ndarray, tess_header: fits.Header):
+def save_fits_outputs(
+    output_dir: Path,
+    sector: int,
+    camera: int,
+    ccd: int,
+    results: np.ndarray,
+    offsets: np.ndarray,
+    tess_header: fits.Header,
+    roi_bounds: tuple[int, int, int, int] | None = None,
+    oversampling_factor: int = 1,
+):
     """
     Save the results as FITS files.
 
@@ -307,7 +363,7 @@ def save_fits_outputs(output_dir: Path, sector: int, camera: int, ccd: int, resu
         save_extensions: Whether to save data, count and mask as HDU extensions
     """
     # Create syndiff header based on TESS header
-    syndiff_header = create_syndiff_header(tess_header)
+    syndiff_header = create_syndiff_header(tess_header, roi_bounds=roi_bounds, oversampling_factor=oversampling_factor)
 
     # Create output directory if it doesn't exist
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -333,11 +389,33 @@ def save_fits_outputs(output_dir: Path, sector: int, camera: int, ccd: int, resu
         hdu3 = fits.ImageHDU(data=results[idx, 2].astype(np.int32), header=offset_header, name="MASK")
 
         hdu_list = fits.HDUList([primary_hdu, hdu1, hdu2, hdu3])
-        output_filename = output_dir / f"syndiff_template_s{sector:04d}_{camera}_{ccd}_dx{dx:.3f}_dy{dy:.3f}.fits"
+        # Build filename including ROI and oversampling when applicable
+        roi_part = ""
+        if roi_bounds is not None:
+            rx0, ry0, rx1, ry1 = roi_bounds
+            if not (rx0 == 0 and ry0 == 0):
+                roi_part = f"_x{rx0}-{rx1}_y{ry0}-{ry1}"
+        os_part = f"_os{oversampling_factor}" if oversampling_factor > 1 else ""
+
+        output_filename = output_dir / f"syndiff_template_s{sector:04d}_{camera}_{ccd}{roi_part}{os_part}_dx{dx:.3f}_dy{dy:.3f}.fits"
         hdu_list.writeto(output_filename, overwrite=True)
 
 
-def main(sector: int = 20, camera: int = 3, ccd: int = 3, offsets: np.ndarray = np.array([[0.0, 0.0]]), ignore_mask_bits: list[int] = [12], data_root: str | Path = "data", convolved_dir: str | Path | None = None, output_base: str | Path | None = None):
+def main(
+    sector: int = 20,
+    camera: int = 3,
+    ccd: int = 3,
+    offsets: np.ndarray = np.array([[0.0, 0.0]]),
+    ignore_mask_bits: list[int] = [12],
+    data_root: str | Path = "data",
+    convolved_dir: str | Path | None = None,
+    output_base: str | Path | None = None,
+    x_min: int | None = None,
+    y_min: int | None = None,
+    x_max: int | None = None,
+    y_max: int | None = None,
+    oversampling_factor: int = 1,
+):
     # Resolve base paths (allow overrides)
     data_root = Path(data_root)
     if convolved_dir is None:
@@ -350,18 +428,20 @@ def main(sector: int = 20, camera: int = 3, ccd: int = 3, offsets: np.ndarray = 
         output_base = Path(output_base)
 
     # Generate paths based on parameters
-    SKYCELL_CSV_PATH = data_root / f"skycell_pixel_mapping/sector_{sector:04d}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_skycells_list.csv"
+    mapping_root = data_root / "skycell_pixel_mapping"
+    if oversampling_factor > 1:
+        mapping_root = mapping_root / f"oversampling_{oversampling_factor}"
+
+    suffix = f"_os{oversampling_factor}" if oversampling_factor > 1 else ""
+    SKYCELL_CSV_PATH = mapping_root / f"sector_{sector:04d}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_skycells_list{suffix}.csv"
     CONVOLVED_DATA_PATH = Path(convolved_dir)
-    REG_FILES_PATTERN = str(data_root / f"skycell_pixel_mapping/sector_{sector:04d}/camera_{camera}/ccd_{ccd}/*.fits.gz")
-    REG_MASTER_FILES_PATH = str(data_root / f"skycell_pixel_mapping/sector_{sector:04d}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_pixels2skycells.fits.gz")
+    REG_FILES_PATTERN = str(mapping_root / f"sector_{sector:04d}/camera_{camera}/ccd_{ccd}/*.fits.gz")
+    REG_MASTER_FILES_PATH = str(mapping_root / f"sector_{sector:04d}/camera_{camera}/ccd_{ccd}/tess_s{sector:04d}_{camera}_{ccd}_master_pixels2skycells{suffix}.fits.gz")
     OUTPUT_DIR = output_base / f"sector{sector:04d}_camera{camera}_ccd{ccd}"
 
     # Processing parameters - adjusted for better memory efficiency
     N_JOBS = 16  # Reduced number of parallel jobs to lower memory pressure
     SKYCELLS_PER_BATCH = 20  # Adjusted for memory usage
-
-    # Create output directory
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load TESS data and WCS
     print("Loading TESS data and WCS...")
@@ -373,10 +453,66 @@ def main(sector: int = 20, camera: int = 3, ccd: int = 3, offsets: np.ndarray = 
         tess_data = hdul[hdu_idx].data.astype(np.float32)
         tess_header = hdul[hdu_idx].header
 
+    if oversampling_factor < 1:
+        raise ValueError("oversampling_factor must be >= 1")
+
+    if oversampling_factor > 1:
+        if tess_data.shape[0] % oversampling_factor != 0 or tess_data.shape[1] % oversampling_factor != 0:
+            raise ValueError("Oversampled mapping dimensions are not divisible by oversampling_factor")
+        base_shape = (tess_data.shape[0] // oversampling_factor, tess_data.shape[1] // oversampling_factor)
+    else:
+        base_shape = tess_data.shape
+
+    # ROI is always in base TESS pixel coordinates [min, max)
+    roi_values = [x_min, y_min, x_max, y_max]
+    if any(value is not None for value in roi_values) and not all(value is not None for value in roi_values):
+        raise ValueError("Provide all ROI bounds together: x_min, y_min, x_max, y_max")
+
+    if all(value is None for value in roi_values):
+        x_min, y_min, x_max, y_max = 0, 0, base_shape[1], base_shape[0]
+    else:
+        x_min = int(x_min)
+        y_min = int(y_min)
+        x_max = int(x_max)
+        y_max = int(y_max)
+
+    if not (0 <= x_min < x_max <= base_shape[1] and 0 <= y_min < y_max <= base_shape[0]):
+        raise ValueError(f"Invalid ROI bounds for base shape {base_shape}: " f"x_min={x_min}, x_max={x_max}, y_min={y_min}, y_max={y_max}")
+
+    roi_bounds = (x_min, y_min, x_max, y_max)
+    print(f"Using ROI (base TESS scale): x=[{x_min},{x_max}), y=[{y_min},{y_max})")
+
+    # Build an output directory name that includes ROI bounds and oversampling
+    roi_suffix = ""
+    if not (x_min == 0 and y_min == 0 and x_max == base_shape[1] and y_max == base_shape[0]):
+        roi_suffix = f"_x{x_min}-{x_max}_y{y_min}-{y_max}"
+    os_suffix = f"_os{oversampling_factor}" if oversampling_factor > 1 else ""
+
+    OUTPUT_DIR = output_base / f"sector{sector:04d}_camera{camera}_ccd{ccd}{roi_suffix}{os_suffix}"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     # Load skycell info
     print("Loading skycell info...")
     usecols = ["NAME", "RA", "DEC"] + RELEVANT_WCS_KEYS
     skycell_df = pd.read_csv(SKYCELL_CSV_PATH, usecols=usecols)
+
+    # Prefilter skycells to only those present in ROI, using master mapping IDs.
+    if oversampling_factor > 1:
+        roi_mapping = tess_data[y_min * oversampling_factor : y_max * oversampling_factor, x_min * oversampling_factor : x_max * oversampling_factor]
+    else:
+        roi_mapping = tess_data[y_min:y_max, x_min:x_max]
+
+    roi_ids = np.unique(roi_mapping.astype(np.int64))
+    roi_ids = roi_ids[roi_ids >= 0]
+
+    if len(roi_ids) > 0:
+        roi_ids = roi_ids[roi_ids < len(skycell_df)]
+        roi_names = set(skycell_df.iloc[roi_ids]["NAME"].tolist())
+        skycell_df = skycell_df[skycell_df["NAME"].isin(roi_names)].reset_index(drop=True)
+        print(f"Prefiltered to {len(skycell_df)} ROI-intersecting skycells")
+    else:
+        print("No mapped skycells found in ROI; output will be empty.")
+        skycell_df = skycell_df.iloc[0:0].copy()
 
     # Load Zarr metadata once for efficient access
     print("Loading Zarr metadata...")
@@ -389,18 +525,43 @@ def main(sector: int = 20, camera: int = 3, ccd: int = 3, offsets: np.ndarray = 
 
     # Get registration files
     print("Getting registration files...")
-    reg_files = sorted(glob(REG_FILES_PATTERN))[1:]
-    skycell_names = [f"skycell.{'.'.join(Path(f).stem.split('.')[1:3])}" for f in reg_files]  # Extract skycell names
+    reg_files_all = sorted(glob(REG_FILES_PATTERN))
+    reg_files = [f for f in reg_files_all if "master_pixels2skycells" not in Path(f).name]
+    skycell_names = [extract_skycell_name_from_reg_file(f) for f in reg_files]
+
+    # Keep only registration files for ROI-intersecting skycells.
+    allowed_names = set(skycell_df["NAME"].tolist())
+    filtered_pairs = [(rf, sn) for rf, sn in zip(reg_files, skycell_names) if sn is not None and sn in allowed_names]
+    reg_files = [rf for rf, _ in filtered_pairs]
+    skycell_names = [sn for _, sn in filtered_pairs]
 
     # Split into batches
-    num_batches = (len(reg_files) + SKYCELLS_PER_BATCH - 1) // SKYCELLS_PER_BATCH
+    num_batches = (len(reg_files) + SKYCELLS_PER_BATCH - 1) // SKYCELLS_PER_BATCH if len(reg_files) > 0 else 0
     print(f"Processing {len(reg_files)} skycells in {num_batches} batches...")
 
-    reg_batches = np.array_split(reg_files, num_batches)
-    name_batches = np.array_split(skycell_names, num_batches)
+    if num_batches > 0:
+        reg_batches = np.array_split(reg_files, num_batches)
+        name_batches = np.array_split(skycell_names, num_batches)
+    else:
+        reg_batches = []
+        name_batches = []
 
     # Process batches in parallel
-    results = Parallel(n_jobs=N_JOBS)(delayed(process_skycell_batch)(i, reg_batch, name_batch, offsets, shifts_dict, tess_data.shape, zarr_path, ignore_mask_bits=ignore_mask_bits) for i, (reg_batch, name_batch) in enumerate(zip(reg_batches, name_batches)))
+    results = Parallel(n_jobs=N_JOBS)(
+        delayed(process_skycell_batch)(
+            i,
+            reg_batch,
+            name_batch,
+            offsets,
+            shifts_dict,
+            base_shape,
+            zarr_path,
+            roi_bounds,
+            oversampling_factor=oversampling_factor,
+            ignore_mask_bits=ignore_mask_bits,
+        )
+        for i, (reg_batch, name_batch) in enumerate(zip(reg_batches, name_batches))
+    )
 
     # Combine results using the sparse array approach
     print("Combining results...")
@@ -444,25 +605,53 @@ def main(sector: int = 20, camera: int = 3, ccd: int = 3, offsets: np.ndarray = 
             combined_counts = unique_counts
             combined_mask_counts = unique_mask_counts
 
-        # Now convert from sparse representation to full array
-        combined_results = np.zeros((len(offsets), 3, *tess_data.shape), dtype=np.float32)
+        # Convert from sparse representation to ROI output array
+        roi_h = y_max - y_min
+        roi_w = x_max - x_min
+        out_h = roi_h * oversampling_factor
+        out_w = roi_w * oversampling_factor
+        combined_results = np.zeros((len(offsets), 3, out_h, out_w), dtype=np.float32)
 
         for i, idx in enumerate(combined_indices):
-            y = idx // tess_data.shape[1]
-            x = idx % tess_data.shape[1]
+            if oversampling_factor > 1:
+                os_width = base_shape[1] * oversampling_factor
+                y_os = idx // os_width
+                x_os = idx % os_width
+                y_base = y_os // oversampling_factor
+                x_base = x_os // oversampling_factor
+                sub_y = y_os % oversampling_factor
+                sub_x = x_os % oversampling_factor
 
-            if 0 <= y < tess_data.shape[0] and 0 <= x < tess_data.shape[1]:
+                if x_min <= x_base < x_max and y_min <= y_base < y_max:
+                    out_y = (y_base - y_min) * oversampling_factor + sub_y
+                    out_x = (x_base - x_min) * oversampling_factor + sub_x
+                else:
+                    continue
+            else:
+                y_base = idx // base_shape[1]
+                x_base = idx % base_shape[1]
+                if x_min <= x_base < x_max and y_min <= y_base < y_max:
+                    out_y = y_base - y_min
+                    out_x = x_base - x_min
+                else:
+                    continue
+
+            if 0 <= out_y < combined_results.shape[2] and 0 <= out_x < combined_results.shape[3]:
                 for offset_idx in range(len(offsets)):
-                    combined_results[offset_idx, 0, y, x] = combined_sums[i, offset_idx]
-                    combined_results[offset_idx, 1, y, x] = combined_counts[i, offset_idx]
-                    combined_results[offset_idx, 2, y, x] = combined_mask_counts[i, offset_idx]
+                    combined_results[offset_idx, 0, out_y, out_x] = combined_sums[i, offset_idx]
+                    combined_results[offset_idx, 1, out_y, out_x] = combined_counts[i, offset_idx]
+                    combined_results[offset_idx, 2, out_y, out_x] = combined_mask_counts[i, offset_idx]
     else:
-        # Create empty results if no data
-        combined_results = np.zeros((len(offsets), 3, *tess_data.shape), dtype=np.float32)
+        # Create empty ROI-sized results if no data
+        roi_h = y_max - y_min
+        roi_w = x_max - x_min
+        out_h = roi_h * oversampling_factor
+        out_w = roi_w * oversampling_factor
+        combined_results = np.zeros((len(offsets), 3, out_h, out_w), dtype=np.float32)
 
     # Save outputs as FITS files
     print("Saving outputs...")
-    save_fits_outputs(output_dir=OUTPUT_DIR, sector=sector, camera=camera, ccd=ccd, results=combined_results, offsets=offsets, tess_header=tess_header)
+    save_fits_outputs(output_dir=OUTPUT_DIR, sector=sector, camera=camera, ccd=ccd, results=combined_results, offsets=offsets, tess_header=tess_header, roi_bounds=roi_bounds, oversampling_factor=oversampling_factor)
 
     # Record processing time
     total_time = time.time() - start_time
@@ -490,20 +679,49 @@ if __name__ == "__main__":
     parser.add_argument("--data-root", type=str, default=str(Path(__file__).resolve().parent / "data"), help="Root data directory")
     parser.add_argument("--convolved-dir", type=str, default=None, help="Convolved results directory (overrides data-root/convolved_results)")
     parser.add_argument("--output-base", type=str, default=None, help="Base output directory (overrides data-root/shifted_downsamples)")
+    parser.add_argument("--x-min", type=int, default=None, help="ROI xmin in base TESS pixels (inclusive)")
+    parser.add_argument("--y-min", type=int, default=None, help="ROI ymin in base TESS pixels (inclusive)")
+    parser.add_argument("--x-max", type=int, default=None, help="ROI xmax in base TESS pixels (exclusive)")
+    parser.add_argument("--y-max", type=int, default=None, help="ROI ymax in base TESS pixels (exclusive)")
+    parser.add_argument("--oversampling-factor", type=int, default=1, help="Oversampling factor for reading mapping files and index decoding")
+    parser.add_argument("--single-offset", action="store_true", help="Use only [0.0, 0.0] offset for fast testing")
     args = parser.parse_args()
 
     # Define offsets to process (could be loaded from a file)
     offsets = np.array(
         [
-            [0.0, 0.0],  # dx, dy
-            [0.1, 0.0],
-            [0.0, 0.1],
+            # [0.0, 0.0],  # dx, dy
+            # [0.1, 0.0],
+            # [0.0, 0.1],
+            [0.0, 0.0],
+            [-0.0122, -0.0154],
+            [-0.018, -0.0345],
+            [-0.021, -0.0541],
+            [-0.0219, -0.0749],
+            [-0.0441, -0.1133],
+            [-0.0485, -0.1147],
+            [-0.0506, -0.1135],
+            [-0.0508, -0.1114],
+            [-0.0506, -0.112],
             # [-0.1, 0.1],
             # [-0.1, -0.1],
+            # [0.0046, -0.0016],
+            # [0.0311, -0.0065],
+            # [0.0417, -0.0223],
+            # [0.0397, -0.0493],
+            # [0.0265, -0.0893],
+            # [-0.0121, -0.0489],
+            # [0.0053, -0.0484],
+            # [0.001, -0.0681],
+            # [-0.0143, -0.0972],
+            # [-0.0552, -0.1575],
         ]
     )
+
+    if args.single_offset:
+        offsets = np.array([[0.0, 0.0]])
 
     # Set mask bits to ignore (0-indexed)
     ignore_mask_bits = [12]
 
-    main(sector=args.sector, camera=args.camera, ccd=args.ccd, offsets=offsets, ignore_mask_bits=ignore_mask_bits, data_root=args.data_root, convolved_dir=args.convolved_dir, output_base=args.output_base)
+    main(sector=args.sector, camera=args.camera, ccd=args.ccd, offsets=offsets, ignore_mask_bits=ignore_mask_bits, data_root=args.data_root, convolved_dir=args.convolved_dir, output_base=args.output_base, x_min=args.x_min, y_min=args.y_min, x_max=args.x_max, y_max=args.y_max, oversampling_factor=args.oversampling_factor)
