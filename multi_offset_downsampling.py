@@ -408,6 +408,7 @@ def main(
     offsets: np.ndarray = np.array([[0.0, 0.0]]),
     ignore_mask_bits: list[int] = [12],
     data_root: str | Path = "data",
+    mapping_dir: str | Path | None = None,
     convolved_dir: str | Path | None = None,
     output_base: str | Path | None = None,
     x_min: int | None = None,
@@ -418,6 +419,10 @@ def main(
 ):
     # Resolve base paths (allow overrides)
     data_root = Path(data_root)
+    if mapping_dir is None:
+        mapping_root = data_root / "skycell_pixel_mapping"
+    else:
+        mapping_root = Path(mapping_dir)
     if convolved_dir is None:
         convolved_dir = data_root / "convolved_results"
     else:
@@ -428,7 +433,6 @@ def main(
         output_base = Path(output_base)
 
     # Generate paths based on parameters
-    mapping_root = data_root / "skycell_pixel_mapping"
     if oversampling_factor > 1:
         mapping_root = mapping_root / f"oversampling_{oversampling_factor}"
 
@@ -677,6 +681,7 @@ if __name__ == "__main__":
     parser.add_argument("camera", nargs="?", type=int, default=3, help="Camera number (default: 3)")
     parser.add_argument("ccd", nargs="?", type=int, default=3, help="CCD number (default: 3)")
     parser.add_argument("--data-root", type=str, default=str(Path(__file__).resolve().parent / "data"), help="Root data directory")
+    parser.add_argument("--mapping-dir", type=str, default=None, help="Skycell pixel mapping directory (default: data-root/skycell_pixel_mapping)")
     parser.add_argument("--convolved-dir", type=str, default=None, help="Convolved results directory (overrides data-root/convolved_results)")
     parser.add_argument("--output-base", type=str, default=None, help="Base output directory (overrides data-root/shifted_downsamples)")
     parser.add_argument("--x-min", type=int, default=None, help="ROI xmin in base TESS pixels (inclusive)")
@@ -724,4 +729,4 @@ if __name__ == "__main__":
     # Set mask bits to ignore (0-indexed)
     ignore_mask_bits = [12]
 
-    main(sector=args.sector, camera=args.camera, ccd=args.ccd, offsets=offsets, ignore_mask_bits=ignore_mask_bits, data_root=args.data_root, convolved_dir=args.convolved_dir, output_base=args.output_base, x_min=args.x_min, y_min=args.y_min, x_max=args.x_max, y_max=args.y_max, oversampling_factor=args.oversampling_factor)
+    main(sector=args.sector, camera=args.camera, ccd=args.ccd, offsets=offsets, ignore_mask_bits=ignore_mask_bits, data_root=args.data_root, mapping_dir=args.mapping_dir, convolved_dir=args.convolved_dir, output_base=args.output_base, x_min=args.x_min, y_min=args.y_min, x_max=args.x_max, y_max=args.y_max, oversampling_factor=args.oversampling_factor)
